@@ -131,6 +131,72 @@ Here the extension tries Haiku on Anthropic first, then Haiku on OpenRouter, the
 
 When all candidates fail, a single error notification lists everything that was tried.
 
+## Inline Model Conditionals
+
+Prompt bodies can embed model-specific instructions directly in the markdown:
+
+```markdown
+---
+description: Cross-model code review
+model: claude-haiku-4-5, claude-sonnet-4-20250514
+---
+Summarize the change first.
+
+<if-model is="claude-haiku-4-5">
+Keep the answer brief and cost-conscious.
+<else>
+Do a deeper pass and call out subtle risks.
+</if-model>
+```
+
+Conditionals are evaluated against the model that actually runs the command after fallback resolution. That means the same template can render differently depending on which candidate was selected.
+
+Supported matches inside `is="..."`:
+
+- Exact `provider/model-id`
+- Exact bare `model-id`
+- Provider wildcard like `anthropic/*`
+- Comma-separated lists combining any of the above
+
+Examples:
+
+```markdown
+<if-model is="anthropic/claude-sonnet-4-20250514">...</if-model>
+<if-model is="claude-sonnet-4-20250514">...</if-model>
+<if-model is="anthropic/*">...</if-model>
+<if-model is="openai/gpt-5.2, anthropic/*">...</if-model>
+```
+
+`<else>` is the fallback branch for the current `<if-model>` block. Nested blocks are supported.
+
+Conditionals are a raw text preprocessing step, not markdown-aware syntax. If you want to show the directive literally inside a prompt, escape it in the source text, for example with `&lt;if-model is="anthropic/*"&gt;`.
+
+## Argument Substitution
+
+Prompt bodies support argument placeholders that expand to command arguments:
+
+| Placeholder | Description |
+|-------------|-------------|
+| `$1`, `$2`, ... | Positional argument (1-indexed) |
+| `$@` | All arguments joined with spaces |
+| `$ARGUMENTS` | Same as `$@` |
+| `${@:N}` | All arguments from position N onward |
+| `${@:N:L}` | L arguments starting from position N |
+
+Example:
+
+```markdown
+---
+model: claude-sonnet-4-20250514
+---
+Analyze $1 focusing on $2. Additional context: ${@:3}
+```
+
+Running `/analyze src/main.ts performance edge cases error handling` expands to:
+- `$1` → `src/main.ts`
+- `$2` → `performance`
+- `${@:3}` → `edge cases error handling`
+
 ## Skill Resolution
 
 The `skill` field matches the skill's directory name:
@@ -158,7 +224,7 @@ Organize prompts in subdirectories for namespacing:
     └── hook.md                 → /hook (user:frontend)
 ```
 
-The subdirectory shows in autocomplete as the source label. Note: command names are based on filename only, so avoid duplicate filenames across subdirectories (e.g., `quick.md` and `frontend/quick.md` would collide).
+The subdirectory shows in autocomplete as the source label. Command names are based on filename only. If duplicates exist within the same source layer, the first one found after lexical sorting wins and later duplicates are skipped with a warning. Reserved command names like `model`, `reload`, and `chain-prompts` are also skipped with a warning.
 
 ## Examples
 
@@ -240,7 +306,7 @@ Switched to Haiku. How can I help?
 
 ## Chaining Templates
 
-The `/chain-prompts` command runs multiple templates sequentially. Each step switches to its own model, injects its own skill, and the conversation context carries forward between steps.
+The `/chain-prompts` command runs multiple templates sequentially. Each step switches to its own model, renders any inline model conditionals against that step’s resolved model, injects its own skill, and the conversation context carries forward between steps.
 
 ```
 /chain-prompts analyze-code -> fix-plan -> summarize -- src/main.ts
@@ -290,7 +356,6 @@ The model switches, skill injects, agent responds, and output prints to stdout. 
 
 ## Limitations
 
-- Templates discovered at startup. Restart pi after adding/modifying.
+- Prompt files are reloaded on session start and whenever an extension-owned prompt command runs. If you add a brand-new prompt file while already inside a session, run another extension-owned command such as `/chain-prompts`, start a new session, or reload pi so the new slash command is registered.
 - Model restore state is in-memory. Closing pi mid-response loses restore state.
 - Only templates with a `model` field can be chained. Templates without `model` are handled by pi core and invisible to this extension.
-- Per-step args containing a literal `->` will be misinterpreted as a step separator. Use shared `--` args or a template file instead.
