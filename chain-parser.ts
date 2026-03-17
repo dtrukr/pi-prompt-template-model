@@ -1,0 +1,162 @@
+import { parseCommandArgs, splitByUnquotedSeparator } from "./args.js";
+
+export interface ChainStep {
+	name: string;
+	args: string[];
+	loopCount?: number;
+}
+
+export interface ParsedChainSteps {
+	steps: ChainStep[];
+	sharedArgs: string[];
+	invalidSegments: string[];
+}
+
+export interface ParsedChainDeclaration {
+	steps: ChainStep[];
+	invalidSegments: string[];
+}
+
+interface SegmentToken {
+	start: number;
+	end: number;
+	value: string;
+	quoted: boolean;
+}
+
+function scanSegmentTokens(segment: string): SegmentToken[] {
+	const tokens: SegmentToken[] = [];
+	let i = 0;
+
+	while (i < segment.length) {
+		while (i < segment.length && /\s/.test(segment[i])) i++;
+		if (i >= segment.length) break;
+
+		const start = i;
+		let inQuote: string | null = null;
+		let value = "";
+		let sawQuoted = false;
+		let sawUnquoted = false;
+
+		while (i < segment.length) {
+			const char = segment[i];
+			if (inQuote) {
+				if (char === inQuote) {
+					inQuote = null;
+				} else {
+					value += char;
+				}
+				i++;
+				continue;
+			}
+
+			if (char === '"' || char === "'") {
+				inQuote = char;
+				sawQuoted = true;
+				i++;
+				continue;
+			}
+			if (/\s/.test(char)) break;
+
+			value += char;
+			sawUnquoted = true;
+			i++;
+		}
+
+		tokens.push({
+			start,
+			end: i,
+			value,
+			quoted: sawQuoted && !sawUnquoted,
+		});
+	}
+
+	return tokens;
+}
+
+function extractStepLoopCount(segment: string): { cleanedSegment: string; loopCount?: number } {
+	const tokens = scanSegmentTokens(segment);
+
+	for (let i = 1; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token.quoted) continue;
+
+		if (token.value.startsWith("--loop=")) {
+			const value = token.value.slice("--loop=".length);
+			if (/^\d+$/.test(value)) {
+				const parsed = parseInt(value, 10);
+				if (parsed >= 1 && parsed <= 999) {
+					const cleanedSegment = `${segment.slice(0, token.start)}${segment.slice(token.end)}`.trim();
+					return { cleanedSegment, loopCount: parsed };
+				}
+			}
+			continue;
+		}
+
+		if (token.value === "--loop" && i + 1 < tokens.length) {
+			const next = tokens[i + 1];
+			if (!next.quoted && /^\d+$/.test(next.value)) {
+				const parsed = parseInt(next.value, 10);
+				if (parsed >= 1 && parsed <= 999) {
+					const cleanedSegment = `${segment.slice(0, token.start)}${segment.slice(next.end)}`.trim();
+					return { cleanedSegment, loopCount: parsed };
+				}
+			}
+		}
+	}
+
+	return { cleanedSegment: segment };
+}
+
+export function parseChainSteps(args: string): ParsedChainSteps {
+	const sharedArgsSplit = splitByUnquotedSeparator(args, " -- ");
+	const templatesPart = sharedArgsSplit[0];
+	const argsPart = sharedArgsSplit.length > 1 ? sharedArgsSplit.slice(1).join(" -- ") : "";
+
+	const invalidSegments: string[] = [];
+	const steps: ChainStep[] = [];
+
+	for (const rawSegment of splitByUnquotedSeparator(templatesPart, "->")) {
+		const segment = rawSegment.trim();
+		if (!segment) {
+			invalidSegments.push(rawSegment);
+			continue;
+		}
+		const tokens = parseCommandArgs(segment);
+		if (tokens.length === 0) {
+			invalidSegments.push(segment);
+			continue;
+		}
+		steps.push({ name: tokens[0], args: tokens.slice(1) });
+	}
+
+	return { steps, sharedArgs: parseCommandArgs(argsPart), invalidSegments };
+}
+
+export function parseChainDeclaration(chain: string): ParsedChainDeclaration {
+	const invalidSegments: string[] = [];
+	const steps: ChainStep[] = [];
+
+	for (const rawSegment of splitByUnquotedSeparator(chain, "->")) {
+		const segment = rawSegment.trim();
+		if (!segment) {
+			invalidSegments.push(rawSegment);
+			continue;
+		}
+
+		const { cleanedSegment, loopCount } = extractStepLoopCount(segment);
+		const tokens = parseCommandArgs(cleanedSegment);
+		if (tokens.length === 0) {
+			invalidSegments.push(segment);
+			continue;
+		}
+
+		steps.push({
+			name: tokens[0],
+			args: tokens.slice(1),
+			loopCount,
+		});
+	}
+
+	return { steps, invalidSegments };
+}

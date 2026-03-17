@@ -1,3 +1,176 @@
+export interface LoopExtraction {
+	args: string;
+	loopCount: number | null;
+	fresh: boolean;
+	converge: boolean;
+}
+
+export interface LoopFlags {
+	args: string;
+	fresh: boolean;
+	converge: boolean;
+}
+
+export function extractLoopCount(argsString: string): LoopExtraction | null {
+	let loopCount: number | null = null;
+	let loopFound = false;
+	let fresh = false;
+	let noConverge = false;
+	const tokensToRemove: Array<{ start: number; end: number }> = [];
+
+	let i = 0;
+	while (i < argsString.length) {
+		const char = argsString[i];
+
+		if (char === '"' || char === "'") {
+			const quote = char;
+			i++;
+			while (i < argsString.length && argsString[i] !== quote) i++;
+			if (i < argsString.length) i++;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			i++;
+			continue;
+		}
+
+		const tokenStart = i;
+		while (i < argsString.length && !/\s/.test(argsString[i])) i++;
+		const token = argsString.slice(tokenStart, i);
+
+		if (!loopFound && (token === "--loop" || token.startsWith("--loop="))) {
+			if (token.startsWith("--loop=")) {
+				const value = token.slice("--loop=".length);
+				if (/^\d+$/.test(value)) {
+					const parsed = parseInt(value, 10);
+					if (parsed >= 1 && parsed <= 999) {
+						loopFound = true;
+						loopCount = parsed;
+						tokensToRemove.push({ start: tokenStart, end: i });
+					}
+				}
+			} else {
+				let lookahead = i;
+				while (lookahead < argsString.length && /\s/.test(argsString[lookahead])) lookahead++;
+
+				if (lookahead < argsString.length && argsString[lookahead] !== '"' && argsString[lookahead] !== "'") {
+					const nextTokenStart = lookahead;
+					while (lookahead < argsString.length && !/\s/.test(argsString[lookahead])) lookahead++;
+					const nextToken = argsString.slice(nextTokenStart, lookahead);
+
+					if (/^\d+$/.test(nextToken)) {
+						const parsed = parseInt(nextToken, 10);
+						if (parsed >= 1 && parsed <= 999) {
+							loopFound = true;
+							loopCount = parsed;
+							tokensToRemove.push({ start: tokenStart, end: i }, { start: nextTokenStart, end: lookahead });
+							i = lookahead;
+						}
+					} else {
+						loopFound = true;
+						loopCount = null;
+						tokensToRemove.push({ start: tokenStart, end: i });
+					}
+				} else {
+					loopFound = true;
+					loopCount = null;
+					tokensToRemove.push({ start: tokenStart, end: i });
+				}
+			}
+		}
+
+		if (token === "--fresh") {
+			fresh = true;
+			tokensToRemove.push({ start: tokenStart, end: i });
+		}
+
+		if (token === "--no-converge") {
+			noConverge = true;
+			tokensToRemove.push({ start: tokenStart, end: i });
+		}
+	}
+
+	if (loopCount === null && !loopFound) return null;
+
+	tokensToRemove.sort((a, b) => b.start - a.start);
+	let cleaned = argsString;
+	for (const { start, end } of tokensToRemove) {
+		cleaned = cleaned.slice(0, start) + cleaned.slice(end);
+	}
+
+	const converge = loopFound && loopCount === null ? true : !noConverge;
+	return { args: cleaned.trim(), loopCount, fresh, converge };
+}
+
+export function extractLoopFlags(argsString: string): LoopFlags {
+	let fresh = false;
+	let noConverge = false;
+	const tokensToRemove: Array<{ start: number; end: number }> = [];
+
+	let i = 0;
+	while (i < argsString.length) {
+		const char = argsString[i];
+
+		if (char === '"' || char === "'") {
+			const quote = char;
+			i++;
+			while (i < argsString.length && argsString[i] !== quote) i++;
+			if (i < argsString.length) i++;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			i++;
+			continue;
+		}
+
+		const tokenStart = i;
+		while (i < argsString.length && !/\s/.test(argsString[i])) i++;
+		const token = argsString.slice(tokenStart, i);
+
+		if (token === "--fresh") {
+			fresh = true;
+			tokensToRemove.push({ start: tokenStart, end: i });
+		}
+
+		if (token === "--no-converge") {
+			noConverge = true;
+			tokensToRemove.push({ start: tokenStart, end: i });
+		}
+	}
+
+	tokensToRemove.sort((a, b) => b.start - a.start);
+	let cleaned = argsString;
+	for (const { start, end } of tokensToRemove) {
+		cleaned = cleaned.slice(0, start) + cleaned.slice(end);
+	}
+
+	return { args: cleaned.trim(), fresh, converge: !noConverge };
+}
+
+export function splitByUnquotedSeparator(input: string, separator: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let inQuote: string | null = null;
+
+	for (let i = 0; i < input.length; i++) {
+		const char = input[i];
+		if (inQuote) {
+			if (char === inQuote) inQuote = null;
+		} else if (char === '"' || char === "'") {
+			inQuote = char;
+		} else if (i <= input.length - separator.length && input.startsWith(separator, i)) {
+			parts.push(input.slice(start, i));
+			start = i + separator.length;
+			i += separator.length - 1;
+		}
+	}
+
+	parts.push(input.slice(start));
+	return parts;
+}
+
 export function parseCommandArgs(argsString: string): string[] {
 	const args: string[] = [];
 	let current = "";
@@ -14,7 +187,7 @@ export function parseCommandArgs(argsString: string): string[] {
 			}
 		} else if (char === '"' || char === "'") {
 			inQuote = char;
-		} else if (char === " " || char === "\t") {
+		} else if (/\s/.test(char)) {
 			if (current) {
 				args.push(current);
 				current = "";

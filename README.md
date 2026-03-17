@@ -86,11 +86,15 @@ Here `skill: surf` loads `~/.pi/agent/skills/surf/SKILL.md` and injects its cont
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `model` | Yes | - | Model ID, `provider/model-id`, or comma-separated list for fallback |
+| `model` | Conditional | - | Required for non-chain templates; ignored when `chain` is set |
+| `chain` | Conditional | - | Chain declaration (`step -> step --loop 2`) for orchestration templates; body is ignored |
 | `skill` | No | - | Skill name to inject into system prompt |
 | `thinking` | No | - | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `description` | No | - | Shown in autocomplete |
 | `restore` | No | `true` | Restore previous model and thinking level after response |
+| `fresh` | No | `false` | Collapse context between loop iterations (applies when looping via `--loop` or frontmatter `loop`) |
+| `loop` | No | - | Default loop count for this template (`1`-`999`) |
+| `converge` | No | `true` | Loop convergence behavior; set `false` to always run all iterations |
 
 ## Model Format
 
@@ -332,6 +336,149 @@ Step 1 uses its per-step args (`"error handling"`), steps 2 and 3 fall back to t
 
 The chain captures your current model and thinking level before starting, and restores them when the chain finishes (or if any step fails mid-chain). Individual template `restore` settings are ignored during chain execution.
 
+### Chain Templates
+
+For reusable pipelines, define a chain in frontmatter instead of typing `/chain-prompts` every time:
+
+```markdown
+---
+description: Review then clean up
+chain: double-check --loop 2 -> deslop --loop 2
+---
+ignored — chain templates don't use the body
+```
+
+This registers `/review-then-clean` as a command that runs `double-check` twice, then `deslop` twice. Each step references a separate prompt template with its own `model`. The chain template itself doesn't need a `model` field — each step uses whatever model its template specifies.
+
+Per-step `--loop N` repeats that step N times before moving to the next. Per-step convergence applies: if a step makes no file changes on an iteration, its inner loop stops early (unless the step's template has `converge: false`).
+
+Chain templates support `loop`, `fresh`, `converge`, and `restore` in their frontmatter for overall execution control:
+
+```markdown
+---
+chain: analyze -> fix
+loop: 3
+fresh: true
+converge: false
+---
+```
+
+This runs the full analyze → fix chain 3 times, with fresh context between iterations and no early stopping. CLI `--loop` overrides frontmatter `loop` when invoking the command.
+
+Chain nesting is not supported — a chain template's steps cannot reference other chain templates.
+
+## Loop Execution
+
+Looping uses the `--loop` flag:
+
+```
+/deslop --loop 5
+/deslop --loop=5
+/deslop "focus on performance" --loop 3
+/deslop --loop
+```
+
+`--loop` without a number means unlimited looping until convergence, with a built-in safety cap of 50 iterations.
+
+You can also set a default loop count in frontmatter:
+
+```markdown
+---
+model: claude-sonnet-4-20250514
+loop: 5
+---
+...
+```
+
+With that template, `/deslop` runs 5 iterations by default. CLI `--loop` overrides frontmatter (`/deslop --loop 3` runs 3 iterations).
+
+The agent runs the same prompt N times. Context accumulates across iterations — by iteration 3, the agent sees the full conversation from iterations 1 and 2 and builds on that work. Use `--fresh` to collapse context between iterations instead (see below).
+
+By default, the loop stops early if an iteration makes no file changes (no `write` or `edit` tool calls), since there's nothing left to improve. Add `--no-converge` to always run all iterations for bounded loops, or set `converge: false` in frontmatter:
+
+```
+/deslop --loop 5 --no-converge
+```
+
+```markdown
+---
+model: claude-sonnet-4-20250514
+loop: 5
+converge: false
+---
+...
+```
+
+Bare `--loop` always forces convergence on (even with `--no-converge` or `converge: false`) because its intent is "run until no changes." `--loop N` and `--loop=N` support range 1-999. Quoted `"--loop"` is treated as a regular argument.
+
+Model, thinking level, and skill are maintained throughout the loop. If the template has `restore: true` (the default), the original model and thinking level are restored after the final iteration (or if any iteration fails). If `restore: false`, the switched model persists after the loop ends.
+
+### Fresh Context
+
+Add `--fresh` to collapse context between iterations:
+
+```
+/deslop --loop 5 --fresh
+/deslop --fresh      # when frontmatter sets loop: N
+```
+
+Each iteration's conversation is collapsed to a brief summary (files read, files modified, outcome) before the next iteration starts. The agent sees accumulated summaries from all previous iterations but not the full conversation. This saves tokens on long loops and gives each iteration a clean slate for reasoning.
+
+You can also set `fresh: true` in the template frontmatter to make it the default when looped:
+
+```markdown
+---
+description: Remove AI slop from code
+model: claude-sonnet-4-20250514
+fresh: true
+---
+Review the codebase and improve code quality. $@
+```
+
+### Loop with Chains
+
+Chains support the same looping forms:
+
+```
+/chain-prompts analyze -> fix --loop 3 -- src/main.ts
+/chain-prompts analyze -> fix --loop=3 -- src/main.ts
+/chain-prompts analyze -> fix --loop -- src/main.ts
+/chain-prompts analyze -> fix --loop 3 --fresh -- src/main.ts
+/chain-prompts analyze -> fix --loop 3 --no-converge -- src/main.ts
+```
+
+This runs the full chain (analyze → fix) three times. Convergence detection applies across all steps in each iteration — if no step made file changes, the loop stops. Each iteration re-reads prompts from disk, so template edits take effect between iterations. The status bar shows `loop 2/3` during execution.
+
+## Agent Tool
+
+The agent can run prompt templates on its own via the `run-prompt` tool. Disabled by default — enable it with:
+
+```
+/prompt-tool on
+```
+
+Once enabled, the agent sees `run-prompt` in its tool list and can call it with any template command:
+
+```
+run-prompt({ command: "deslop --loop 5 --fresh" })
+run-prompt({ command: "deslop --loop" })
+run-prompt({ command: "chain-prompts analyze -> fix --loop 3" })
+```
+
+The tool queues the command for execution when the agent's current turn ends. All loop, fresh context, and convergence features work the same as when invoked via slash commands.
+
+Add guidance to steer when the agent uses it:
+
+```
+/prompt-tool on Use run-prompt for iterative code improvement tasks
+/prompt-tool guidance Use sparingly, only for multi-pass refinement
+/prompt-tool guidance clear
+/prompt-tool off
+/prompt-tool
+```
+
+Config persists across sessions in `~/.pi/agent/prompt-template-model.json`.
+
 ## Autocomplete Display
 
 Commands show model, thinking level, and skill in the description:
@@ -358,4 +505,5 @@ The model switches, skill injects, agent responds, and output prints to stdout. 
 
 - Prompt files are reloaded on session start and whenever an extension-owned prompt command runs. If you add a brand-new prompt file while already inside a session, run another extension-owned command such as `/chain-prompts`, start a new session, or reload pi so the new slash command is registered.
 - Model restore state is in-memory. Closing pi mid-response loses restore state.
-- Only templates with a `model` field can be chained. Templates without `model` are handled by pi core and invisible to this extension.
+- Chain steps must reference templates with a `model` field. Chain templates themselves use `chain` and do not execute their own body.
+- The `run-prompt` tool must be explicitly enabled with `/prompt-tool on` before the agent can use it.

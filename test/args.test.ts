@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseCommandArgs, substituteArgs } from "../args.js";
+import { extractLoopCount, extractLoopFlags, parseCommandArgs, substituteArgs } from "../args.js";
 
 test("parseCommandArgs respects quoted segments", () => {
 	assert.deepEqual(parseCommandArgs('alpha "two words" beta'), ["alpha", "two words", "beta"]);
@@ -15,4 +15,147 @@ test("substituteArgs supports positional, aggregate, and slice replacements", ()
 test("substituteArgs is non-recursive", () => {
 	const result = substituteArgs("$1 / $@", ["$2", "$ARGUMENTS"]);
 	assert.equal(result, "$2 / $2 $ARGUMENTS");
+});
+
+test("extractLoopCount extracts --loop N and --loop=N forms", () => {
+	assert.deepEqual(extractLoopCount("--loop 5"), { args: "", loopCount: 5, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop=5"), { args: "", loopCount: 5, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop 1"), { args: "", loopCount: 1, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop=999"), { args: "", loopCount: 999, fresh: false, converge: true });
+});
+
+test("extractLoopCount preserves surrounding quoted args", () => {
+	assert.deepEqual(extractLoopCount('"fix auth bug" --loop 3'), { args: '"fix auth bug"', loopCount: 3, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("'fix auth bug' --loop=3"), { args: "'fix auth bug'", loopCount: 3, fresh: false, converge: true });
+});
+
+test("extractLoopCount handles chain-style args with -> and --", () => {
+	const result = extractLoopCount('analyze -> fix --loop=3 -- "src/main.ts"');
+	assert.ok(result);
+	assert.equal(result.loopCount, 3);
+	assert.equal(result.args, 'analyze -> fix  -- "src/main.ts"');
+	assert.equal(result.converge, true);
+});
+
+test("extractLoopCount treats bare --loop as unlimited", () => {
+	assert.deepEqual(extractLoopCount("--loop"), { args: "", loopCount: null, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop 5x"), { args: "5x", loopCount: null, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop -1"), { args: "-1", loopCount: null, fresh: false, converge: true });
+	assert.deepEqual(extractLoopCount("--loop --fresh"), { args: "", loopCount: null, fresh: true, converge: true });
+	assert.deepEqual(extractLoopCount("--loop --no-converge"), { args: "", loopCount: null, fresh: false, converge: true });
+});
+
+test("extractLoopCount keeps quoted --loop as literal", () => {
+	assert.equal(extractLoopCount('"--loop"'), null);
+	assert.equal(extractLoopCount('"--loop" task'), null);
+});
+
+test("extractLoopCount treats invalid --loop numeric values as regular args", () => {
+	assert.equal(extractLoopCount("--loop 0"), null);
+	assert.equal(extractLoopCount("--loop 1000"), null);
+	assert.equal(extractLoopCount("--loop=0"), null);
+	assert.equal(extractLoopCount("--loop=1000"), null);
+	assert.equal(extractLoopCount("--loop=abc"), null);
+});
+
+test("extractLoopCount allows bounded --loop with no-converge", () => {
+	assert.deepEqual(extractLoopCount("--loop 5 --no-converge"), {
+		args: "",
+		loopCount: 5,
+		fresh: false,
+		converge: false,
+	});
+	assert.deepEqual(extractLoopCount("--loop 5 --fresh"), {
+		args: "",
+		loopCount: 5,
+		fresh: true,
+		converge: true,
+	});
+});
+
+test("extractLoopCount removes all repeated loop flags", () => {
+	assert.deepEqual(extractLoopCount("--loop 2 task --fresh --fresh --no-converge --no-converge"), {
+		args: "task",
+		loopCount: 2,
+		fresh: true,
+		converge: false,
+	});
+});
+
+test("extractLoopCount handles newline-separated flags", () => {
+	assert.deepEqual(extractLoopCount("task\n--loop 3\n--fresh"), {
+		args: "task",
+		loopCount: 3,
+		fresh: true,
+		converge: true,
+	});
+});
+
+test("extractLoopCount returns null when no loop token exists", () => {
+	assert.equal(extractLoopCount("regular args"), null);
+	assert.equal(extractLoopCount(""), null);
+	assert.equal(extractLoopCount("5x"), null);
+	assert.equal(extractLoopCount("3x task"), null);
+});
+
+test("extractLoopCount ignores --fresh and --no-converge without --loop", () => {
+	assert.equal(extractLoopCount("--fresh"), null);
+	assert.equal(extractLoopCount("task --fresh"), null);
+	assert.equal(extractLoopCount("--no-converge"), null);
+	assert.equal(extractLoopCount("task --no-converge"), null);
+});
+
+test("extractLoopCount composes with parseCommandArgs and substituteArgs", () => {
+	const loop = extractLoopCount('"focus on performance" --loop 3');
+	assert.ok(loop);
+	const args = parseCommandArgs(loop.args);
+	assert.equal(substituteArgs("Review: $@", args), "Review: focus on performance");
+});
+
+test("extractLoopFlags removes unquoted --fresh and --no-converge", () => {
+	assert.deepEqual(extractLoopFlags("--fresh task --no-converge --fresh"), {
+		args: "task",
+		fresh: true,
+		converge: false,
+	});
+});
+
+test("extractLoopFlags preserves quoted flags", () => {
+	assert.deepEqual(extractLoopFlags('"--fresh" \'--no-converge\' --fresh'), {
+		args: '"--fresh" \'--no-converge\'',
+		fresh: true,
+		converge: true,
+	});
+});
+
+test("extractLoopFlags defaults when no flags are present", () => {
+	assert.deepEqual(extractLoopFlags("regular args"), {
+		args: "regular args",
+		fresh: false,
+		converge: true,
+	});
+});
+
+test("extractLoopFlags composes with parseCommandArgs and substituteArgs", () => {
+	const flags = extractLoopFlags('--fresh "focus on performance"');
+	assert.equal(flags.fresh, true);
+	assert.equal(flags.converge, true);
+	const args = parseCommandArgs(flags.args);
+	assert.equal(substituteArgs("Review: $@", args), "Review: focus on performance");
+});
+
+test("extractLoopFlags extracts --no-converge and removes all occurrences", () => {
+	assert.deepEqual(extractLoopFlags("--no-converge task --no-converge"), {
+		args: "task",
+		fresh: false,
+		converge: false,
+	});
+});
+
+test("extractLoopFlags handles newline-separated flags", () => {
+	assert.deepEqual(extractLoopFlags("task\n--fresh\r\n--no-converge"), {
+		args: "task",
+		fresh: true,
+		converge: false,
+	});
 });

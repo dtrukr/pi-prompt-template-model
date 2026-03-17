@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.5.0] - 2026-03-17
+
+### Added
+
+- Loop execution via `--loop` flag: `--loop N`, `--loop=N` to run a prompt N times (1-999), or bare `--loop` for unlimited until convergence with a 50-iteration safety cap. Bare `--loop` always forces convergence on.
+- Frontmatter loop controls: templates can now set `loop: N` (1-999) and `converge: false` defaults; CLI `--loop` overrides frontmatter `loop`, and `--no-converge` disables convergence for bounded loops.
+- Convergence detection: loops stop early when an iteration makes no file changes (`write`/`edit`). Enabled by default; `--no-converge` opts out.
+- Fresh context mode: `--fresh` flag or `fresh: true` frontmatter collapses conversation between loop iterations, keeping only accumulated summaries. Saves tokens on long loops.
+- Loop iteration context injected into the system prompt so the agent builds on previous work across iterations.
+- Loop progress indicator in the TUI status bar.
+- `run-prompt` agent tool: the agent can run prompt templates, chains, and loops on its own. Opt-in via `/prompt-tool on [guidance]`. Config persists in `~/.pi/agent/prompt-template-model.json`.
+- Chain templates: new `chain` frontmatter field to declare reusable template pipelines (`chain: double-check --loop 2 -> deslop --loop 2`). Per-step `--loop N` loops each step independently. No `model` required — each step uses its own. Supports `loop`, `fresh`, `converge`, `restore` for overall execution control. Chain nesting is rejected at runtime.
+
+### Fixed
+
+- `readSkillContent` no longer swallows read errors. The caller now sees the actual error message (e.g., permission denied) instead of a generic "Failed to read skill" notification.
+- `restoreSessionState` no longer clears `pendingSkill` as a side effect unrelated to model/thinking restoration.
+- Error diagnostics now consistently use `String(error)` instead of hardcoded fallback strings.
+
 ## [0.4.0] - 2026-03-13
 
 ### Added

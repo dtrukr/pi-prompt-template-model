@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadPromptsWithModel, RESERVED_COMMAND_NAMES } from "../prompt-loader.js";
+import { buildPromptCommandDescription, loadPromptsWithModel, RESERVED_COMMAND_NAMES } from "../prompt-loader.js";
 
 function withTempHome(run: (root: string) => void) {
 	const root = mkdtempSync(join(tmpdir(), "pi-prompt-template-model-"));
@@ -140,6 +140,158 @@ test("loadPromptsWithModel rejects non-object frontmatter roots", () => {
 	});
 });
 
+test("loadPromptsWithModel parses fresh frontmatter field", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), '---\nmodel: claude-sonnet-4-20250514\nfresh: true\n---\nbody');
+		writeFileSync(join(cwd, ".pi", "prompts", "normal.md"), '---\nmodel: claude-sonnet-4-20250514\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.get("deslop")?.fresh, true);
+		assert.equal(result.prompts.get("normal")?.fresh, undefined);
+	});
+});
+
+test("loadPromptsWithModel parses numeric loop frontmatter field", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), "---\nmodel: claude-sonnet-4-20250514\nloop: 5\n---\nbody");
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.get("deslop")?.loop, 5);
+	});
+});
+
+test("loadPromptsWithModel parses string loop frontmatter field", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), '---\nmodel: claude-sonnet-4-20250514\nloop: "7"\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.get("deslop")?.loop, 7);
+	});
+});
+
+test("loadPromptsWithModel diagnoses and ignores invalid loop frontmatter values", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "bad-loop.md"), "---\nmodel: claude-sonnet-4-20250514\nloop: 0\n---\nbody");
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.get("bad-loop")?.loop, undefined);
+		assert.match(result.diagnostics.map((item) => item.message).join("\n"), /invalid loop value/i);
+	});
+});
+
+test("loadPromptsWithModel normalizes converge frontmatter values", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "converge-true.md"), "---\nmodel: claude-sonnet-4-20250514\nconverge: true\n---\nbody");
+		writeFileSync(join(cwd, ".pi", "prompts", "converge-false.md"), "---\nmodel: claude-sonnet-4-20250514\nconverge: false\n---\nbody");
+		writeFileSync(join(cwd, ".pi", "prompts", "converge-invalid.md"), "---\nmodel: claude-sonnet-4-20250514\nconverge: maybe\n---\nbody");
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.get("converge-true")?.converge, undefined);
+		assert.equal(result.prompts.get("converge-false")?.converge, false);
+		assert.equal(result.prompts.get("converge-invalid")?.converge, undefined);
+		assert.match(result.diagnostics.map((item) => item.message).join("\n"), /default converge=true/i);
+	});
+});
+
+test("loadPromptsWithModel loads chain templates without model and description shows chain metadata", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "review-and-clean.md"),
+			'---\nchain: "double-check --loop 2 -> deslop --loop 2"\ndescription: "Review then clean up slop"\n---\nignored',
+		);
+
+		const result = loadPromptsWithModel(cwd);
+		const prompt = result.prompts.get("review-and-clean");
+		assert.ok(prompt);
+		assert.equal(prompt.models.length, 0);
+		assert.equal(prompt.chain, "double-check --loop 2 -> deslop --loop 2");
+		assert.equal(buildPromptCommandDescription(prompt), "Review then clean up slop [chain: double-check --loop 2 -> deslop --loop 2] (project)");
+	});
+});
+
+test("loadPromptsWithModel ignores model/thinking/skill fields on chain templates without diagnostics", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "chain-ignore.md"),
+			'---\nchain: "analyze -> fix"\nmodel: 123\nthinking: turbo\nskill: 42\n---\nignored',
+		);
+
+		const result = loadPromptsWithModel(cwd);
+		const prompt = result.prompts.get("chain-ignore");
+		assert.ok(prompt);
+		assert.equal(prompt.chain, "analyze -> fix");
+		assert.equal(prompt.models.length, 0);
+		assert.equal(prompt.thinking, undefined);
+		assert.equal(prompt.skill, undefined);
+
+		const diagnosticText = result.diagnostics.map((item) => item.message).join("\n");
+		assert.doesNotMatch(diagnosticText, /invalid model|empty model|invalid thinking|invalid skill/i);
+	});
+});
+
+test("loadPromptsWithModel stores loop/fresh/converge frontmatter on chain templates", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "chain-flags.md"),
+			'---\nchain: "analyze -> fix"\nloop: 3\nfresh: true\nconverge: false\n---\nignored',
+		);
+
+		const result = loadPromptsWithModel(cwd);
+		const prompt = result.prompts.get("chain-flags");
+		assert.ok(prompt);
+		assert.equal(prompt.chain, "analyze -> fix");
+		assert.equal(prompt.loop, 3);
+		assert.equal(prompt.fresh, true);
+		assert.equal(prompt.converge, false);
+	});
+});
+
+test("loadPromptsWithModel diagnoses invalid chain frontmatter values", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "chain-number.md"), "---\nmodel: claude-sonnet-4-20250514\nchain: 123\n---\nbody");
+		writeFileSync(join(cwd, ".pi", "prompts", "chain-empty.md"), '---\nmodel: claude-sonnet-4-20250514\nchain: "   "\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		const diagnosticText = result.diagnostics.map((item) => item.message).join("\n");
+		assert.match(diagnosticText, /frontmatter field "chain" must be a string/i);
+		assert.match(diagnosticText, /frontmatter field "chain" must be a non-empty string/i);
+	});
+});
+
+test("buildPromptCommandDescription includes loop metadata", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "deslop.md"),
+			'---\nmodel: claude-sonnet-4-20250514\ndescription: "Deslop"\nskill: tmux\nloop: 5\n---\nbody',
+		);
+
+		const result = loadPromptsWithModel(cwd);
+		const prompt = result.prompts.get("deslop");
+		assert.ok(prompt);
+		assert.equal(buildPromptCommandDescription(prompt), "Deslop [claude-sonnet-4-20250514 +tmux loop:5] (project)");
+	});
+});
+
 test("reserved built-in command mirror is explicit", () => {
 	assert.deepEqual([...RESERVED_COMMAND_NAMES].sort(), [
 		"chain-prompts",
@@ -154,6 +306,7 @@ test("reserved built-in command mirror is explicit", () => {
 		"model",
 		"name",
 		"new",
+		"prompt-tool",
 		"quit",
 		"reload",
 		"resume",

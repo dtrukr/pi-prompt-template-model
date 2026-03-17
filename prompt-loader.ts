@@ -7,6 +7,7 @@ import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export const RESERVED_COMMAND_NAMES = new Set([
 	"chain-prompts",
+	"prompt-tool",
 	"settings",
 	"model",
 	"scoped-models",
@@ -35,9 +36,13 @@ export interface PromptWithModel {
 	description: string;
 	content: string;
 	models: string[];
+	chain?: string;
 	restore: boolean;
 	skill?: string;
 	thinking?: ThinkingLevel;
+	fresh?: boolean;
+	loop?: number;
+	converge?: boolean;
 	source: PromptSource;
 	subdir?: string;
 	filePath: string;
@@ -208,6 +213,119 @@ function normalizeRestore(
 	return true;
 }
 
+function normalizeFresh(
+	value: unknown,
+	filePath: string,
+	source: PromptSource,
+	diagnostics: PromptLoaderDiagnostic[],
+): boolean {
+	if (value === undefined) return false;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "true") return true;
+		if (normalized === "false") return false;
+	}
+
+	diagnostics.push(
+		createDiagnostic(
+			"invalid-fresh",
+			filePath,
+			source,
+			`Using default fresh=false for ${filePath}: frontmatter field "fresh" must be true or false.`,
+		),
+	);
+	return false;
+}
+
+function normalizeLoop(
+	value: unknown,
+	filePath: string,
+	source: PromptSource,
+	diagnostics: PromptLoaderDiagnostic[],
+): number | undefined {
+	if (value === undefined) return undefined;
+
+	let normalizedValue: number | undefined;
+	if (typeof value === "number") {
+		normalizedValue = value;
+	} else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+		normalizedValue = parseInt(value.trim(), 10);
+	}
+
+	if (normalizedValue !== undefined && Number.isInteger(normalizedValue) && normalizedValue >= 1 && normalizedValue <= 999) {
+		return normalizedValue;
+	}
+
+	diagnostics.push(
+		createDiagnostic(
+			"invalid-loop",
+			filePath,
+			source,
+			`Ignoring invalid loop value in ${filePath}: frontmatter field "loop" must be an integer between 1 and 999.`,
+		),
+	);
+	return undefined;
+}
+
+function normalizeConverge(
+	value: unknown,
+	filePath: string,
+	source: PromptSource,
+	diagnostics: PromptLoaderDiagnostic[],
+): boolean {
+	if (value === undefined) return true;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "true") return true;
+		if (normalized === "false") return false;
+	}
+
+	diagnostics.push(
+		createDiagnostic(
+			"invalid-converge",
+			filePath,
+			source,
+			`Using default converge=true for ${filePath}: frontmatter field "converge" must be true or false.`,
+		),
+	);
+	return true;
+}
+
+function normalizeChain(
+	value: unknown,
+	filePath: string,
+	source: PromptSource,
+	diagnostics: PromptLoaderDiagnostic[],
+): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		diagnostics.push(
+			createDiagnostic(
+				"invalid-chain",
+				filePath,
+				source,
+				`Ignoring invalid chain value in ${filePath}: frontmatter field "chain" must be a string.`,
+			),
+		);
+		return undefined;
+	}
+
+	const normalized = value.trim();
+	if (normalized.length > 0) return normalized;
+
+	diagnostics.push(
+		createDiagnostic(
+			"empty-chain",
+			filePath,
+			source,
+			`Ignoring invalid chain value in ${filePath}: frontmatter field "chain" must be a non-empty string.`,
+		),
+	);
+	return undefined;
+}
+
 function normalizeThinking(
 	value: unknown,
 	filePath: string,
@@ -255,7 +373,7 @@ function loadPromptsWithModelFromDir(
 				"unreadable-directory",
 				dir,
 				source,
-				`Skipping prompt directory ${dir}: ${error instanceof Error ? error.message : "failed to resolve directory"}.`,
+				`Skipping prompt directory ${dir}: ${error instanceof Error ? error.message : String(error)}.`,
 			),
 		);
 		return { prompts, diagnostics };
@@ -288,13 +406,13 @@ function loadPromptsWithModelFromDir(
 					const stats = statSync(fullPath);
 					isFile = stats.isFile();
 					isDirectory = stats.isDirectory();
-				} catch {
+				} catch (error) {
 					diagnostics.push(
 						createDiagnostic(
 							"unreadable-symlink",
 							fullPath,
 							source,
-							`Skipping unreadable symlink at ${fullPath}.`,
+							`Skipping unreadable symlink at ${fullPath}: ${error instanceof Error ? error.message : String(error)}.`,
 						),
 					);
 					continue;
@@ -317,8 +435,9 @@ function loadPromptsWithModelFromDir(
 				const frontmatter = normalizeFrontmatterRecord(parsed.frontmatter, fullPath, source, diagnostics);
 				if (!frontmatter) continue;
 				const { body } = parsed;
-				const models = normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
-				if (!models) continue;
+				const chain = normalizeChain(frontmatter.chain, fullPath, source, diagnostics);
+				const models = chain ? [] : normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
+				if (!chain && !models) continue;
 
 				const name = entry.name.slice(0, -3);
 				if (RESERVED_COMMAND_NAMES.has(name)) {
@@ -334,18 +453,25 @@ function loadPromptsWithModelFromDir(
 				}
 
 				const description = normalizeStringField("description", frontmatter.description, fullPath, source, diagnostics) ?? "";
-				const skill = normalizeStringField("skill", frontmatter.skill, fullPath, source, diagnostics);
-				const thinking = normalizeThinking(frontmatter.thinking, fullPath, source, diagnostics);
+				const skill = chain ? undefined : normalizeStringField("skill", frontmatter.skill, fullPath, source, diagnostics);
+				const thinking = chain ? undefined : normalizeThinking(frontmatter.thinking, fullPath, source, diagnostics);
 				const restore = normalizeRestore(frontmatter.restore, fullPath, source, diagnostics);
+				const fresh = normalizeFresh(frontmatter.fresh, fullPath, source, diagnostics);
+				const loop = normalizeLoop(frontmatter.loop, fullPath, source, diagnostics);
+				const converge = normalizeConverge(frontmatter.converge, fullPath, source, diagnostics);
 
 				prompts.push({
 					name,
 					description,
 					content: body,
 					models,
+					chain: chain || undefined,
 					restore,
 					skill,
 					thinking,
+					fresh: fresh || undefined,
+					loop: loop || undefined,
+					converge: converge === false ? false : undefined,
 					source,
 					subdir: subdir || undefined,
 					filePath: fullPath,
@@ -356,7 +482,7 @@ function loadPromptsWithModelFromDir(
 						"invalid-prompt-file",
 						fullPath,
 						source,
-						`Skipping prompt template at ${fullPath}: ${error instanceof Error ? error.message : "failed to parse file"}.`,
+						`Skipping prompt template at ${fullPath}: ${error instanceof Error ? error.message : String(error)}.`,
 					),
 				);
 			}
@@ -367,7 +493,7 @@ function loadPromptsWithModelFromDir(
 				"unreadable-directory",
 				dir,
 				source,
-				`Skipping prompt directory ${dir}: ${error instanceof Error ? error.message : "failed to read directory"}.`,
+				`Skipping prompt directory ${dir}: ${error instanceof Error ? error.message : String(error)}.`,
 			),
 		);
 	}
@@ -420,10 +546,15 @@ export function loadPromptsWithModel(cwd: string): LoadPromptsWithModelResult {
 
 export function buildPromptCommandDescription(prompt: PromptWithModel): string {
 	const sourceLabel = prompt.subdir ? `(${prompt.source}:${prompt.subdir})` : `(${prompt.source})`;
+	if (prompt.chain) {
+		const details = `[chain: ${prompt.chain}] ${sourceLabel}`;
+		return prompt.description ? `${prompt.description} ${details}` : details;
+	}
 	const modelLabel = prompt.models.map((model) => model.split("/").pop() || model).join("|");
 	const skillLabel = prompt.skill ? ` +${prompt.skill}` : "";
 	const thinkingLabel = prompt.thinking ? ` ${prompt.thinking}` : "";
-	const details = `[${modelLabel}${thinkingLabel}${skillLabel}] ${sourceLabel}`;
+	const loopLabel = prompt.loop ? ` loop:${prompt.loop}` : "";
+	const details = `[${modelLabel}${thinkingLabel}${skillLabel}${loopLabel}] ${sourceLabel}`;
 	return prompt.description ? `${prompt.description} ${details}` : details;
 }
 
@@ -437,11 +568,7 @@ export function resolveSkillPath(skillName: string, cwd: string): string | undef
 	return undefined;
 }
 
-export function readSkillContent(skillPath: string): string | undefined {
-	try {
-		const raw = readFileSync(skillPath, "utf-8");
-		return parseFrontmatter(raw).body;
-	} catch {
-		return undefined;
-	}
+export function readSkillContent(skillPath: string): string {
+	const raw = readFileSync(skillPath, "utf-8");
+	return parseFrontmatter(raw).body;
 }
