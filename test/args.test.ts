@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractLoopCount, extractLoopFlags, parseCommandArgs, substituteArgs } from "../args.js";
+import { extractLoopCount, extractLoopFlags, extractPromptRunOptions, parseCommandArgs, substituteArgs } from "../args.js";
 
 test("parseCommandArgs respects quoted segments", () => {
 	assert.deepEqual(parseCommandArgs('alpha "two words" beta'), ["alpha", "two words", "beta"]);
@@ -168,5 +168,25 @@ test("extractLoopFlags handles newline-separated flags", () => {
 		args: "task",
 		fresh: true,
 		converge: false,
+	});
+});
+
+test("extractPromptRunOptions removes model, thinking, skill, and restore flags", () => {
+	assert.deepEqual(extractPromptRunOptions('--model gpt-5.4-mini --thinking=low --skill frontend-design --no-restore make UI better'), {
+		args: "make UI better",
+		model: "gpt-5.4-mini",
+		thinking: "low",
+		skill: "frontend-design",
+		restore: false,
+	});
+});
+
+test("extractPromptRunOptions preserves quoted flag-like content", () => {
+	assert.deepEqual(extractPromptRunOptions('"--model" "--thinking" draft copy'), {
+		args: '"--model" "--thinking" draft copy',
+		model: undefined,
+		thinking: undefined,
+		skill: undefined,
+		restore: undefined,
 	});
 });

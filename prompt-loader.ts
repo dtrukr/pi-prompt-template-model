@@ -7,6 +7,7 @@ import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export const RESERVED_COMMAND_NAMES = new Set([
 	"chain-prompts",
+	"prompt",
 	"prompt-tool",
 	"settings",
 	"model",

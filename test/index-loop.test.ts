@@ -653,6 +653,97 @@ test("queued run-prompt restores pending session state before executing queued c
 	});
 });
 
+test("prompt command runs inline prompt with model, thinking, skill, and restore", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(root, ".pi", "agent", "skills", "tmux"), { recursive: true });
+		writeFileSync(join(root, ".pi", "agent", "skills", "tmux", "SKILL.md"), "---\nname: tmux\ndescription: helper\n---\nUse tmux.");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const prompt = pi.commands.get("prompt");
+		assert.ok(prompt);
+		await prompt.handler("--model anthropic/target-model --thinking low --skill tmux make UI modern", ctx);
+
+		assert.deepEqual(pi.userMessages, ["make UI modern"]);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model"]);
+		assert.equal(pi.getThinkingLevel(), "low");
+
+		const beforeStart = await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx);
+		const message = beforeStart?.message as { content?: string } | undefined;
+		assert.match(message?.content ?? "", /Use tmux\./);
+
+		await pi.emit("agent_end", {}, ctx);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+		assert.deepEqual(pi.currentModel, baseModel);
+		assert.equal(pi.getThinkingLevel(), "medium");
+	});
+});
+
+test("prompt command supports inline looping with run-level flags", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const prompt = pi.commands.get("prompt");
+		assert.ok(prompt);
+		await prompt.handler("--model anthropic/target-model tighten hierarchy --loop 2 --no-converge", ctx);
+
+		assert.deepEqual(pi.userMessages, ["tighten hierarchy", "tighten hierarchy"]);
+		assert.match(getNotifications().join("\n"), /Loop finished: 2\/2 iterations/);
+	});
+});
+
+test("chain-prompts supports inline steps and run-level defaults", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "analyze.md"),
+			'---\ndescription: "analyze"\n---\nANALYZE:<if-model is="anthropic/target-model">TARGET<else>BASE</if-model>',
+		);
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "verify.md"),
+			'---\ndescription: verify\n---\n<if-model is="anthropic/target-model">VERIFY<else>FAIL</if-model>',
+		);
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const chainPrompts = pi.commands.get("chain-prompts");
+		assert.ok(chainPrompts);
+		await chainPrompts.handler('--model anthropic/target-model --thinking low analyze -> "make UI better" -> verify', ctx);
+
+		assert.deepEqual(pi.userMessages, ["ANALYZE:TARGET", "make UI better", "VERIFY"]);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+		assert.deepEqual(pi.currentModel, baseModel);
+		assert.equal(pi.getThinkingLevel(), "medium");
+	});
+});
+
 test("prompt loop does not report completion when execution throws mid-run", async () => {
 	await withTempHome(async (root) => {
 		const cwd = join(root, "project");

@@ -11,6 +11,14 @@ export interface LoopFlags {
 	converge: boolean;
 }
 
+export interface PromptRunOptions {
+	args: string;
+	model?: string;
+	thinking?: string;
+	skill?: string;
+	restore?: boolean;
+}
+
 export function extractLoopCount(argsString: string): LoopExtraction | null {
 	let loopCount: number | null = null;
 	let loopFound = false;
@@ -150,6 +158,113 @@ export function extractLoopFlags(argsString: string): LoopFlags {
 	}
 
 	return { args: cleaned.trim(), fresh, converge: !noConverge };
+}
+
+export function extractPromptRunOptions(argsString: string): PromptRunOptions {
+	let model: string | undefined;
+	let thinking: string | undefined;
+	let skill: string | undefined;
+	let restore: boolean | undefined;
+	const tokensToRemove: Array<{ start: number; end: number }> = [];
+
+	let i = 0;
+	while (i < argsString.length) {
+		const char = argsString[i];
+
+		if (char === '"' || char === "'") {
+			const quote = char;
+			i++;
+			while (i < argsString.length && argsString[i] !== quote) i++;
+			if (i < argsString.length) i++;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			i++;
+			continue;
+		}
+
+		const tokenStart = i;
+		while (i < argsString.length && !/\s/.test(argsString[i])) i++;
+		const token = argsString.slice(tokenStart, i);
+
+		const consumeValueFlag = (prefix: "--model=" | "--thinking=" | "--skill=", onValue: (value: string) => void) => {
+			if (!token.startsWith(prefix)) return false;
+			const value = token.slice(prefix.length).trim();
+			if (!value) return false;
+			onValue(value);
+			tokensToRemove.push({ start: tokenStart, end: i });
+			return true;
+		};
+
+		if (consumeValueFlag("--model=", (value) => {
+			if (model === undefined) model = value;
+		})) {
+			continue;
+		}
+		if (consumeValueFlag("--thinking=", (value) => {
+			if (thinking === undefined) thinking = value;
+		})) {
+			continue;
+		}
+		if (consumeValueFlag("--skill=", (value) => {
+			if (skill === undefined) skill = value;
+		})) {
+			continue;
+		}
+
+		const consumeSeparatedValueFlag = (flag: "--model" | "--thinking" | "--skill", onValue: (value: string) => void) => {
+			if (token !== flag) return false;
+			let lookahead = i;
+			while (lookahead < argsString.length && /\s/.test(argsString[lookahead])) lookahead++;
+			if (lookahead >= argsString.length) return false;
+			if (argsString[lookahead] === '"' || argsString[lookahead] === "'") return false;
+
+			const valueStart = lookahead;
+			while (lookahead < argsString.length && !/\s/.test(argsString[lookahead])) lookahead++;
+			const value = argsString.slice(valueStart, lookahead);
+			if (!value) return false;
+
+			onValue(value);
+			tokensToRemove.push({ start: tokenStart, end: i }, { start: valueStart, end: lookahead });
+			i = lookahead;
+			return true;
+		};
+
+		if (consumeSeparatedValueFlag("--model", (value) => {
+			if (model === undefined) model = value;
+		})) {
+			continue;
+		}
+		if (consumeSeparatedValueFlag("--thinking", (value) => {
+			if (thinking === undefined) thinking = value;
+		})) {
+			continue;
+		}
+		if (consumeSeparatedValueFlag("--skill", (value) => {
+			if (skill === undefined) skill = value;
+		})) {
+			continue;
+		}
+
+		if (token === "--restore") {
+			restore = true;
+			tokensToRemove.push({ start: tokenStart, end: i });
+			continue;
+		}
+		if (token === "--no-restore") {
+			restore = false;
+			tokensToRemove.push({ start: tokenStart, end: i });
+		}
+	}
+
+	tokensToRemove.sort((a, b) => b.start - a.start);
+	let cleaned = argsString;
+	for (const { start, end } of tokensToRemove) {
+		cleaned = cleaned.slice(0, start) + cleaned.slice(end);
+	}
+
+	return { args: cleaned.trim(), model, thinking, skill, restore };
 }
 
 export function splitByUnquotedSeparator(input: string, separator: string): string[] {

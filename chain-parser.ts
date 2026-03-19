@@ -1,7 +1,9 @@
 import { parseCommandArgs, splitByUnquotedSeparator } from "./args.js";
 
 export interface ChainStep {
+	type: "prompt" | "inline";
 	name: string;
+	content?: string;
 	args: string[];
 	loopCount?: number;
 }
@@ -121,6 +123,35 @@ function extractStepLoopCount(segment: string): { cleanedSegment: string; loopCo
 	return { cleanedSegment: cleanedSegment.trim(), loopCount };
 }
 
+function parseChainStepSegment(segment: string, loopCount?: number): ChainStep | undefined {
+	const tokens = scanSegmentTokens(segment);
+	if (tokens.length === 0) {
+		return undefined;
+	}
+
+	if (tokens.length === 1 && tokens[0].quoted) {
+		return {
+			type: "inline",
+			name: "<inline>",
+			content: tokens[0].value,
+			args: [],
+			loopCount,
+		};
+	}
+
+	const parsed = parseCommandArgs(segment);
+	if (parsed.length === 0) {
+		return undefined;
+	}
+
+	return {
+		type: "prompt",
+		name: parsed[0],
+		args: parsed.slice(1),
+		loopCount,
+	};
+}
+
 export function parseChainSteps(args: string): ParsedChainSteps {
 	const sharedArgsSplit = splitByUnquotedSeparator(args, " -- ");
 	const templatesPart = sharedArgsSplit[0];
@@ -135,12 +166,12 @@ export function parseChainSteps(args: string): ParsedChainSteps {
 			invalidSegments.push(rawSegment);
 			continue;
 		}
-		const tokens = parseCommandArgs(segment);
-		if (tokens.length === 0) {
+		const step = parseChainStepSegment(segment);
+		if (!step) {
 			invalidSegments.push(segment);
 			continue;
 		}
-		steps.push({ name: tokens[0], args: tokens.slice(1) });
+		steps.push(step);
 	}
 
 	return { steps, sharedArgs: parseCommandArgs(argsPart), invalidSegments };
@@ -158,17 +189,12 @@ export function parseChainDeclaration(chain: string): ParsedChainDeclaration {
 		}
 
 		const { cleanedSegment, loopCount } = extractStepLoopCount(segment);
-		const tokens = parseCommandArgs(cleanedSegment);
-		if (tokens.length === 0) {
+		const step = parseChainStepSegment(cleanedSegment, loopCount);
+		if (!step) {
 			invalidSegments.push(segment);
 			continue;
 		}
-
-		steps.push({
-			name: tokens[0],
-			args: tokens.slice(1),
-			loopCount,
-		});
+		steps.push(step);
 	}
 
 	return { steps, invalidSegments };

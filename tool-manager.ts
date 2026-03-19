@@ -57,13 +57,14 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 			name: "run-prompt",
 			label: "Run Prompt",
 			description:
-				"Run a prompt template command. Pass the template name and any arguments. " +
+				"Run a prompt workflow command. Pass a saved template name, `prompt` for one-off inline prompts, and any arguments. " +
 				"Supports --loop for loops (e.g. 'deslop --loop 5', 'deslop --loop=5', 'deslop --loop' for unlimited until convergence with a 50-iteration cap), " +
 				"--fresh for context collapse between iterations, and --no-converge to disable early stopping for bounded loops. " +
-				"Use 'chain-prompts template1 -> template2' for chaining.",
+				"Use 'prompt --model gpt-5.4-mini improve the UI' for inline runs or 'chain-prompts template1 -> \"inline step\" -> template2' for chaining.",
 			parameters: Type.Object({
 				command: Type.String({
-					description: "Template name and arguments (e.g. 'deslop --loop 5 --fresh', 'deslop --loop', 'chain-prompts analyze -> fix --loop=3')",
+					description:
+						"Workflow command and arguments (e.g. 'deslop --loop 5 --fresh', 'prompt --model gpt-5.4-mini tighten hierarchy', 'chain-prompts analyze -> \"inline step\" -> fix --loop=3')",
 				}),
 			}),
 			execute: async (_id, params) => {

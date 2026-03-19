@@ -4,7 +4,7 @@
 
 # Prompt Template Model Extension
 
-**Pi prompt templates on steroids.** Adds `model`, `skill`, and `thinking` frontmatter support. Create specialized agent modes that switch to the right model, set thinking level, and inject the right skill, then auto-restore when done.
+**Pi prompt templates on steroids.** Adds `model`, `skill`, and `thinking` frontmatter support for saved prompts, plus one-off inline workflows via `/prompt` and mixed `/chain-prompts` runs.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -64,6 +64,12 @@ Run `/debug-python some issue` and the agent has:
 - Sonnet as the active model
 - Full tmux skill instructions already loaded
 - Your task ready to go
+
+You can also skip saved templates for ad hoc runs:
+
+```text
+/prompt --model gpt-5.4-mini --thinking low make the UI feel more modern
+```
 
 ## Skills as a Cheat Code
 
@@ -332,6 +338,12 @@ Each step can also receive its own args, overriding the shared args for that ste
 
 Here `analyze-code` gets `$@ = "look at error handling"`, `fix-plan` gets `$@ = "focus on perf"`, and `summarize` has no per-step args so it falls back to the shared args (empty in this case, but conversation context from prior steps is usually enough).
 
+Quoted standalone steps are treated as inline prompts, so you can mix saved templates and one-off instructions:
+
+```
+/chain-prompts analyze-code -> "make UI better" -> verify
+```
+
 You can mix both:
 
 ```
@@ -341,6 +353,13 @@ You can mix both:
 Step 1 uses its per-step args (`"error handling"`), steps 2 and 3 fall back to the shared args (`"src/main.ts"`).
 
 The chain captures your current model and thinking level before starting, and restores them when the chain finishes (or if any step fails mid-chain). Individual template `restore` settings are ignored during chain execution.
+
+Run-level defaults also work on `/prompt` and `/chain-prompts`:
+
+```text
+/prompt --model gpt-5.4-mini --thinking low --skill frontend-design tighten hierarchy
+/chain-prompts --model gpt-5.4-mini --thinking low analyze -> "make UI better" -> verify
+```
 
 ### Chain Templates
 
@@ -469,6 +488,7 @@ Once enabled, the agent sees `run-prompt` in its tool list and can call it with 
 ```
 run-prompt({ command: "deslop --loop 5 --fresh" })
 run-prompt({ command: "deslop --loop" })
+run-prompt({ command: "prompt --model gpt-5.4-mini tighten hierarchy" })
 run-prompt({ command: "chain-prompts analyze -> fix --loop 3" })
 ```
 

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `/prompt` for one-off inline workflows with run-level `--model`, `--thinking`, `--skill`, `--restore`, `--loop`, `--fresh`, and `--no-converge` controls.
+- Added mixed `/chain-prompts` execution so quoted standalone steps are treated as inline prompts instead of saved template names.
+
+### Changed
+
+- `/chain-prompts` now accepts run-level `--model`, `--thinking`, `--skill`, and `--restore` defaults that apply to inline steps and model-less saved steps.
+- The `run-prompt` tool guidance now documents inline `/prompt` runs and mixed saved-plus-inline chains.
+
 ## [0.6.0] - 2026-03-19
 
 ### Changed

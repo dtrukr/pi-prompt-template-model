@@ -1,7 +1,7 @@
 import type { Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { extractLoopCount, extractLoopFlags, parseCommandArgs } from "./args.js";
+import { extractLoopCount, extractLoopFlags, extractPromptRunOptions, parseCommandArgs, type PromptRunOptions } from "./args.js";
 import { parseChainSteps, parseChainDeclaration, type ChainStep } from "./chain-parser.js";
 import { generateIterationSummary, didIterationMakeChanges, getIterationEntries } from "./loop-utils.js";
 import { notify, summarizePromptDiagnostics, diagnosticsFingerprint } from "./notifications.js";
@@ -38,6 +38,14 @@ interface ExecutionErrorState {
 	hasError: boolean;
 	error: unknown;
 }
+
+interface RuntimePrompt extends Pick<PromptWithModel, "name" | "description" | "content" | "models" | "restore" | "skill" | "thinking" | "converge"> {
+	source?: PromptWithModel["source"];
+	subdir?: PromptWithModel["subdir"];
+	chain?: PromptWithModel["chain"];
+}
+
+const VALID_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 export default function promptModelExtension(pi: ExtensionAPI) {
 	let prompts = new Map<string, PromptWithModel>();
@@ -80,6 +88,61 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 				await runPromptCommand(name, args, ctx);
 			},
 		});
+	}
+
+	function normalizeThinkingLevel(level: string | undefined): ThinkingLevel | undefined {
+		if (!level) return undefined;
+		return VALID_THINKING_LEVELS.includes(level as ThinkingLevel) ? (level as ThinkingLevel) : undefined;
+	}
+
+	function resolveRunOptions(args: string, ctx: ExtensionCommandContext): { args: string; options: PromptRunOptions } | null {
+		const options = extractPromptRunOptions(args);
+		if (options.thinking && !normalizeThinkingLevel(options.thinking)) {
+			notify(ctx, `Invalid thinking level: ${JSON.stringify(options.thinking)}`, "error");
+			return null;
+		}
+		return { args: options.args, options };
+	}
+
+	function applyRunDefaults(prompt: PromptWithModel, options: PromptRunOptions): RuntimePrompt {
+		return {
+			...prompt,
+			models: prompt.models.length > 0 ? prompt.models : options.model ? [options.model] : [],
+			thinking: prompt.thinking ?? normalizeThinkingLevel(options.thinking),
+			skill: prompt.skill ?? options.skill,
+		};
+	}
+
+	function createInlinePrompt(content: string, options: PromptRunOptions, name = "prompt"): RuntimePrompt {
+		return {
+			name,
+			description: "Inline prompt",
+			content,
+			models: options.model ? [options.model] : [],
+			restore: options.restore ?? true,
+			skill: options.skill,
+			thinking: normalizeThinkingLevel(options.thinking),
+		};
+	}
+
+	function buildRuntimePromptDescription(prompt: RuntimePrompt): string {
+		if (prompt.source) {
+			return buildPromptCommandDescription(prompt as PromptWithModel);
+		}
+		const modelLabel = prompt.models.length > 0 ? prompt.models.join("|") : "current";
+		const thinkingLabel = prompt.thinking ? ` ${prompt.thinking}` : "";
+		const skillLabel = prompt.skill ? ` +${prompt.skill}` : "";
+		return `[inline ${modelLabel}${thinkingLabel}${skillLabel}]`;
+	}
+
+	function resolveChainRuntimePrompt(step: ChainStep, options: PromptRunOptions): RuntimePrompt | undefined {
+		if (step.type === "inline") {
+			return createInlinePrompt(step.content ?? "", options, `inline:${step.content ?? ""}`);
+		}
+
+		const prompt = prompts.get(step.name);
+		if (!prompt) return undefined;
+		return applyRunDefaults(prompt, options);
 	}
 
 	function refreshPrompts(cwd: string, ctx?: ExtensionContext) {
@@ -279,6 +342,8 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 
 		if (name === "chain-prompts") {
 			await runChainCommand(args, ctx);
+		} else if (name === "prompt") {
+			await runInlinePromptCommand(args, ctx);
 		} else {
 			await runPromptCommand(name, args, ctx);
 		}
@@ -428,15 +493,17 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		converge: boolean,
 		shouldRestore: boolean,
 		ctx: ExtensionCommandContext,
+		runOptions: PromptRunOptions = {},
 	) {
 		const validateChainSteps = (): boolean => {
-			const missingTemplates = steps.filter((step) => !prompts.has(step.name));
+			const missingTemplates = steps.filter((step) => step.type === "prompt" && !prompts.has(step.name));
 			if (missingTemplates.length > 0) {
 				notify(ctx, `Templates not found: ${missingTemplates.map((step) => step.name).join(", ")}`, "error");
 				return false;
 			}
 
 			for (const step of steps) {
+				if (step.type !== "prompt") continue;
 				const stepPrompt = prompts.get(step.name);
 				if (!stepPrompt) continue;
 				if (stepPrompt.chain) {
@@ -462,7 +529,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		const useConverge = isUnlimited ? true : converge;
 
 		const anchorId = fresh ? ctx.sessionManager.getLeafId() : null;
-		const chainStepNames = steps.map((step) => step.name).join(" -> ");
+		const chainStepNames = steps.map((step) => (step.type === "inline" ? step.content ?? "<inline>" : step.name)).join(" -> ");
 		let completedIterations = 0;
 		let converged = false;
 		let chainErrorState: ExecutionErrorState = { hasError: false, error: undefined };
@@ -483,9 +550,11 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 
 				const iterationStartId = ctx.sessionManager.getLeafId();
 				const templates = steps.map((step) => ({
-					...prompts.get(step.name)!,
+					...resolveChainRuntimePrompt(step, runOptions)!,
 					stepArgs: step.args,
 					stepLoop: step.loopCount ?? 1,
+					stepType: step.type,
+					stepLabel: step.type === "inline" ? step.content ?? "<inline>" : step.name,
 				}));
 				let aborted = false;
 
@@ -513,7 +582,11 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 										: `Loop ${iteration + 1}, `
 									: "";
 							const iterSuffix = stepLoop > 1 ? ` (iter ${stepIteration + 1}/${stepLoop})` : "";
-							notify(ctx, `${loopPrefix}Step ${stepNumber}/${templates.length}: ${template.name}${iterSuffix} ${buildPromptCommandDescription(template)}`, "info");
+							notify(
+								ctx,
+								`${loopPrefix}Step ${stepNumber}/${templates.length}: ${template.stepLabel}${iterSuffix} ${buildRuntimePromptDescription(template)}`,
+								"info",
+							);
 
 							const prepared = await preparePromptExecution(template, effectiveArgs, currentModel, ctx.modelRegistry, {
 								inheritedModel: chainInheritedModel,
@@ -745,6 +818,176 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		await ctx.waitForIdle();
 	}
 
+	async function runInlinePromptCommand(args: string, ctx: ExtensionCommandContext) {
+		storedCommandCtx = ctx;
+		const resolved = resolveRunOptions(args, ctx);
+		if (!resolved) return;
+		const loop = extractLoopCount(resolved.args);
+		const inlineArgs = loop ? loop.args : resolved.args;
+		const content = parseCommandArgs(inlineArgs).join(" ");
+		if (!content.trim()) {
+			notify(ctx, "No inline prompt specified", "error");
+			return;
+		}
+
+		const prompt = createInlinePrompt(content, resolved.options);
+		if (loop) {
+			const savedModel = getCurrentModel(ctx);
+			const savedThinking = pi.getThinkingLevel();
+			let currentModel = savedModel;
+			let currentThinking = savedThinking;
+			const effectiveMax = loop.loopCount ?? UNLIMITED_LOOP_CAP;
+			const isUnlimited = loop.loopCount === null;
+			const anchorId = loop.fresh ? ctx.sessionManager.getLeafId() : null;
+
+			loopState = { currentIteration: 1, totalIterations: loop.loopCount };
+			accumulatedSummaries = [];
+			updateLoopStatus(ctx);
+			let completedIterations = 0;
+			let converged = false;
+			let loopErrorState: ExecutionErrorState = { hasError: false, error: undefined };
+
+			try {
+				for (let i = 0; i < effectiveMax; i++) {
+					loopState.currentIteration = i + 1;
+					updateLoopStatus(ctx);
+					const iterationLabel = loop.loopCount !== null ? `${i + 1}/${loop.loopCount}` : `${i + 1}`;
+					notify(ctx, `Loop ${iterationLabel}: inline prompt`, "info");
+
+					const prepared = await preparePromptExecution(prompt, [], currentModel, ctx.modelRegistry);
+					if (!prepared) {
+						notify(ctx, `No available model from: ${prompt.models.join(", ")}`, "error");
+						break;
+					}
+					if ("message" in prepared) {
+						if (prepared.warning) notify(ctx, prepared.warning, "warning");
+						notify(ctx, prepared.message, "error");
+						break;
+					}
+					if (prepared.warning) notify(ctx, prepared.warning, "warning");
+
+					const skillResolution = resolveSkillMessage(prompt.skill, ctx.cwd);
+					if (skillResolution.kind === "error") {
+						notify(ctx, skillResolution.error, "error");
+						break;
+					}
+
+					if (!prepared.selectedModel.alreadyActive) {
+						const switched = await pi.setModel(prepared.selectedModel.model);
+						if (!switched) {
+							notify(ctx, `Failed to switch to model ${prepared.selectedModel.model.provider}/${prepared.selectedModel.model.id}`, "error");
+							break;
+						}
+						runtimeModel = prepared.selectedModel.model;
+					}
+					currentModel = prepared.selectedModel.model;
+					currentThinking = pi.getThinkingLevel();
+
+					if (prompt.thinking) {
+						pi.setThinkingLevel(prompt.thinking);
+						currentThinking = pi.getThinkingLevel();
+					}
+
+					pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
+					const iterationStartId = ctx.sessionManager.getLeafId();
+
+					pi.sendUserMessage(prepared.content);
+					await waitForTurnStart(ctx);
+					await ctx.waitForIdle();
+					completedIterations++;
+
+					if (loop.converge && (isUnlimited || effectiveMax > 1) && !didIterationMakeChanges(getIterationEntries(ctx, iterationStartId))) {
+						converged = true;
+						break;
+					}
+
+					if (anchorId && i < effectiveMax - 1) {
+						freshCollapse = { targetId: anchorId, task: "inline prompt", iteration: i + 1, totalIterations: loop.loopCount };
+						const result = await ctx.navigateTree(anchorId, { summarize: true });
+						freshCollapse = null;
+						if (result.cancelled) {
+							notify(ctx, "Loop cancelled", "warning");
+							break;
+						}
+					}
+				}
+			} catch (error) {
+				loopErrorState = { hasError: true, error };
+			} finally {
+				loopErrorState = await restoreAfterExecution(
+					ctx,
+					prompt.restore,
+					savedModel,
+					savedThinking,
+					currentModel,
+					currentThinking,
+					loopErrorState,
+					"loop",
+				);
+
+				loopState = null;
+				pendingSkillMessage = undefined;
+				freshCollapse = null;
+				accumulatedSummaries = [];
+				updateLoopStatus(ctx);
+
+				if (!loopErrorState.hasError) {
+					notifyLoopCompletion(ctx, completedIterations, loop.loopCount, effectiveMax, converged, false);
+				}
+			}
+
+			if (loopErrorState.hasError) {
+				throw loopErrorState.error;
+			}
+			return;
+		}
+
+		const savedModel = getCurrentModel(ctx);
+		const savedThinking = pi.getThinkingLevel();
+		const prepared = await preparePromptExecution(prompt, [], savedModel, ctx.modelRegistry);
+		if (!prepared) {
+			notify(ctx, `No available model from: ${prompt.models.join(", ")}`, "error");
+			return;
+		}
+		if ("message" in prepared) {
+			if (prepared.warning) notify(ctx, prepared.warning, "warning");
+			notify(ctx, prepared.message, "error");
+			return;
+		}
+		if (prepared.warning) notify(ctx, prepared.warning, "warning");
+
+		const skillResolution = resolveSkillMessage(prompt.skill, ctx.cwd);
+		if (skillResolution.kind === "error") {
+			notify(ctx, skillResolution.error, "error");
+			return;
+		}
+
+		if (!prepared.selectedModel.alreadyActive) {
+			const switched = await pi.setModel(prepared.selectedModel.model);
+			if (!switched) {
+				notify(ctx, `Failed to switch to model ${prepared.selectedModel.model.provider}/${prepared.selectedModel.model.id}`, "error");
+				return;
+			}
+			runtimeModel = prepared.selectedModel.model;
+		}
+
+		if (prompt.restore && !prepared.selectedModel.alreadyActive) {
+			previousModel = savedModel;
+			previousThinking = savedThinking;
+		}
+		if (prompt.thinking) {
+			if (prompt.restore && previousThinking === undefined && prompt.thinking !== savedThinking) {
+				previousThinking = savedThinking;
+			}
+			pi.setThinkingLevel(prompt.thinking);
+		}
+		pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
+
+		pi.sendUserMessage(prepared.content);
+		await waitForTurnStart(ctx);
+		await ctx.waitForIdle();
+	}
+
 	function resetSessionScopedState(ctx: ExtensionContext) {
 		storedCommandCtx = null;
 		pendingSkillMessage = undefined;
@@ -841,9 +1084,11 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		refreshPrompts(ctx.cwd, ctx);
 
 		const loop = extractLoopCount(args);
-		const cleanedArgs = loop ? loop.args : args;
+		const loopCleanedArgs = loop ? loop.args : args;
+		const resolved = resolveRunOptions(loopCleanedArgs, ctx);
+		if (!resolved) return;
 
-		const { steps, sharedArgs, invalidSegments } = parseChainSteps(cleanedArgs);
+		const { steps, sharedArgs, invalidSegments } = parseChainSteps(resolved.args);
 		if (invalidSegments.length > 0) {
 			notify(ctx, `Invalid chain step: ${invalidSegments[0]}`, "error");
 			return;
@@ -853,7 +1098,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		await runSharedChainExecution(steps, sharedArgs, loop ? loop.loopCount : 1, loop?.fresh === true, loop?.converge ?? true, true, ctx);
+		await runSharedChainExecution(steps, sharedArgs, loop ? loop.loopCount : 1, loop?.fresh === true, loop?.converge ?? true, resolved.options.restore ?? true, ctx, resolved.options);
 	}
 
 	refreshPrompts(process.cwd());
@@ -863,6 +1108,12 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		description: "Chain prompt templates sequentially [template -> template -> ...]",
 		handler: async (args, ctx) => {
 			await runChainCommand(args, ctx);
+		},
+	});
+	pi.registerCommand("prompt", {
+		description: "Run a one-off inline prompt [--model ... --thinking ... --skill ... <text>]",
+		handler: async (args, ctx) => {
+			await runInlinePromptCommand(args, ctx);
 		},
 	});
 	toolManager.registerCommand();

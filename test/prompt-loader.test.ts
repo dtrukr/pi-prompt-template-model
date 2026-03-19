@@ -418,6 +418,7 @@ test("reserved built-in command mirror is explicit", () => {
 		"name",
 		"new",
 		"prompt-tool",
+		"prompt",
 		"quit",
 		"reload",
 		"resume",
