@@ -15,7 +15,7 @@
 │  /debug-python  ──►  Extension detects model + skill                        │
 │       │                                                                     │
 │       ▼                                                                     │
-│  Switches to Sonnet  ──►  Injects tmux skill into system prompt             │
+│  Switches to Sonnet  ──►  Queues tmux skill context for next turn           │
 │       │                                                                     │
 │       ▼                                                                     │
 │  Agent responds with Sonnet + tmux expertise                                │
@@ -49,7 +49,7 @@ Restart pi to load the extension.
 
 ## Quick Start
 
-Add `model` and optionally `skill` to any prompt template:
+Add `model` (or omit it to inherit the current session model) and optionally `skill` to any prompt template:
 
 ```markdown
 ---
@@ -80,15 +80,15 @@ skill: surf
 $@
 ```
 
-Here `skill: surf` loads `~/.pi/agent/skills/surf/SKILL.md` and injects its content directly into the system prompt before the agent even sees your task. No decision-making, no read tool, just immediate expertise. It's a forcing function for when you know exactly what workflow the agent needs.
+Here `skill: surf` loads `~/.pi/agent/skills/surf/SKILL.md` and injects its content as a context message on the next turn before the agent handles your task. No decision-making, no read tool, just immediate expertise. It's a forcing function for when you know exactly what workflow the agent needs.
 
 ## Frontmatter Fields
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `model` | Conditional | - | Required for non-chain templates; ignored when `chain` is set |
+| `model` | No | `current` | Target model(s). If omitted on a non-chain template, execution inherits the current session model. Ignored when `chain` is set. |
 | `chain` | Conditional | - | Chain declaration (`step -> step --loop 2`) for orchestration templates; body is ignored |
-| `skill` | No | - | Skill name to inject into system prompt |
+| `skill` | No | - | Skill name to inject as next-turn context message |
 | `thinking` | No | - | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `description` | No | - | Shown in autocomplete |
 | `restore` | No | `true` | Restore previous model and thinking level after response |
@@ -153,7 +153,7 @@ Do a deeper pass and call out subtle risks.
 </if-model>
 ```
 
-Conditionals are evaluated against the model that actually runs the command after fallback resolution. That means the same template can render differently depending on which candidate was selected.
+Conditionals are evaluated against the model that actually runs the command. For fallback prompts, that means after candidate resolution; for prompts without `model`, that means the current session model. The same template can render differently depending on which model is active.
 
 Supported matches inside `is="..."`:
 
@@ -183,6 +183,7 @@ Prompt bodies support argument placeholders that expand to command arguments:
 |-------------|-------------|
 | `$1`, `$2`, ... | Positional argument (1-indexed) |
 | `$@` | All arguments joined with spaces |
+| `@$` | Alias for `$@` |
 | `$ARGUMENTS` | Same as `$@` |
 | `${@:N}` | All arguments from position N onward |
 | `${@:N:L}` | L arguments starting from position N |
@@ -203,17 +204,22 @@ Running `/analyze src/main.ts performance edge cases error handling` expands to:
 
 ## Skill Resolution
 
-The `skill` field matches the skill's directory name:
+The `skill` field accepts either a bare skill name or a slash-command style name:
 
 ```yaml
 skill: tmux
+# also valid
+skill: skill:tmux
 ```
 
-Resolves to (checked in order):
-1. `<cwd>/.pi/skills/tmux/SKILL.md` (project)
-2. `~/.pi/agent/skills/tmux/SKILL.md` (user)
+Resolution order:
+1. Registered skill commands from `pi.getCommands()` (`source: "skill"`), matched by `skill:name` or `name`
+2. `<cwd>/.pi/skills/<name>/SKILL.md` or `<cwd>/.pi/skills/<name>.md`
+3. `.agents/skills` in `cwd` and ancestor directories (up to git repo root)
+4. `~/.pi/agent/skills/<name>/SKILL.md` or `~/.pi/agent/skills/<name>.md`
+5. `~/.agents/skills/<name>/SKILL.md` or `~/.agents/skills/<name>.md`
 
-This matches pi's precedence - project skills override user skills.
+If the configured skill file is missing or unreadable, the command fails fast and does not send the prompt body to the model.
 
 ## Subdirectories
 
@@ -310,7 +316,7 @@ Switched to Haiku. How can I help?
 
 ## Chaining Templates
 
-The `/chain-prompts` command runs multiple templates sequentially. Each step switches to its own model, renders any inline model conditionals against that step’s resolved model, injects its own skill, and the conversation context carries forward between steps.
+The `/chain-prompts` command runs multiple templates sequentially. Each step switches to its own model (or, if the step has no `model`, to the chain-start model snapshot), renders inline model conditionals against that resolved step model, injects its own skill context message, and conversation context carries forward between steps.
 
 ```
 /chain-prompts analyze-code -> fix-plan -> summarize -- src/main.ts
@@ -348,7 +354,7 @@ chain: double-check --loop 2 -> deslop --loop 2
 ignored — chain templates don't use the body
 ```
 
-This registers `/review-then-clean` as a command that runs `double-check` twice, then `deslop` twice. Each step references a separate prompt template with its own `model`. The chain template itself doesn't need a `model` field — each step uses whatever model its template specifies.
+This registers `/review-then-clean` as a command that runs `double-check` twice, then `deslop` twice. Each step references a separate prompt template. Steps with `model` use their configured model; steps without `model` inherit the chain-start model snapshot (the model active when the chain command began), so behavior stays deterministic even if earlier steps switch models.
 
 Per-step `--loop N` repeats that step N times before moving to the next. Per-step convergence applies: if a step makes no file changes on an iteration, its inner loop stops early (unless the step's template has `converge: false`).
 
@@ -448,7 +454,7 @@ Chains support the same looping forms:
 /chain-prompts analyze -> fix --loop 3 -- src/main.ts
 ```
 
-This runs the full chain (analyze → fix) three times. The final example adds optional shared args: ` -- src/main.ts` means "pass `src/main.ts` to any step that doesn't already have its own args." If you don't need shared args, leave that part out entirely. Convergence detection applies across all steps in each iteration — if no step made file changes, the loop stops. Each iteration re-reads prompts from disk, so template edits take effect between iterations. The status bar shows `loop 2/3` during execution.
+This runs the full chain (analyze → fix) three times. The final example adds optional shared args: ` -- src/main.ts` means "pass `src/main.ts` to any step that doesn't already have its own args." If you don't need shared args, leave that part out entirely. Convergence detection applies across all steps in each iteration — if no step made file changes, the loop stops. Each iteration re-reads prompts from disk, so template edits take effect between iterations. The status bar shows `loop 2/3` during execution. Chain frontmatter declarations also support per-step `--loop N` inside the `chain:` value (for example `chain: double-check --loop 3 -> simplify -> deslop`).
 
 ## Agent Tool
 
@@ -500,11 +506,12 @@ These commands work in print mode too:
 pi -p "/debug-python my code crashes on line 42"
 ```
 
-The model switches, skill injects, agent responds, and output prints to stdout. Useful for scripting or piping to other tools.
+The model switches, a skill context message is injected, the agent responds, and output prints to stdout. Useful for scripting or piping to other tools.
 
 ## Limitations
 
 - Prompt files are reloaded on session start and whenever an extension-owned prompt command runs. If you add a brand-new prompt file while already inside a session, run another extension-owned command such as `/chain-prompts`, start a new session, or reload pi so the new slash command is registered.
 - Model restore state is in-memory. Closing pi mid-response loses restore state.
-- Chain steps must reference templates with a `model` field. Chain templates themselves use `chain` and do not execute their own body.
+- Model-less templates are only managed by this extension when they use extension features (for example `skill`, `thinking`, loop flags, or inline `<if-model ...>`). Plain prompt templates without extension features stay with pi's default prompt loader to avoid command conflicts.
+- In chains, model-less steps inherit the chain-start model snapshot, not the immediately previous step model. This is intentional for deterministic behavior.
 - The `run-prompt` tool must be explicitly enabled with `/prompt-tool on` before the agent can use it.

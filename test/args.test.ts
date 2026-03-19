@@ -17,6 +17,11 @@ test("substituteArgs is non-recursive", () => {
 	assert.equal(result, "$2 / $2 $ARGUMENTS");
 });
 
+test("substituteArgs supports @$ as alias for all args", () => {
+	const result = substituteArgs("Args: @$", ["one", "two"]);
+	assert.equal(result, "Args: one two");
+});
+
 test("extractLoopCount extracts --loop N and --loop=N forms", () => {
 	assert.deepEqual(extractLoopCount("--loop 5"), { args: "", loopCount: 5, fresh: false, converge: true });
 	assert.deepEqual(extractLoopCount("--loop=5"), { args: "", loopCount: 5, fresh: false, converge: true });
@@ -73,12 +78,18 @@ test("extractLoopCount allows bounded --loop with no-converge", () => {
 	});
 });
 
-test("extractLoopCount removes all repeated loop flags", () => {
-	assert.deepEqual(extractLoopCount("--loop 2 task --fresh --fresh --no-converge --no-converge"), {
+test("extractLoopCount removes repeated loop tokens and loop-adjacent flags", () => {
+	assert.deepEqual(extractLoopCount("--loop 2 --loop 3 task --fresh --fresh --no-converge --no-converge"), {
 		args: "task",
 		loopCount: 2,
 		fresh: true,
 		converge: false,
+	});
+	assert.deepEqual(extractLoopCount("--loop 0 --loop 2 task"), {
+		args: "task",
+		loopCount: 2,
+		fresh: false,
+		converge: true,
 	});
 });
 

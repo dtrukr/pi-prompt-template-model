@@ -22,11 +22,29 @@ interface FreshCollapse {
 	totalIterations: number | null;
 }
 
+interface PendingSkillMessage {
+	customType: "skill-loaded";
+	content: string;
+	display: true;
+	details: SkillLoadedDetails;
+}
+
+type SkillMessageResolution =
+	| { kind: "none" }
+	| { kind: "ready"; message: PendingSkillMessage }
+	| { kind: "error"; error: string };
+
+interface ExecutionErrorState {
+	hasError: boolean;
+	error: unknown;
+}
+
 export default function promptModelExtension(pi: ExtensionAPI) {
 	let prompts = new Map<string, PromptWithModel>();
 	let previousModel: Model<any> | undefined;
 	let previousThinking: ThinkingLevel | undefined;
-	let pendingSkill: { name: string; cwd: string } | undefined;
+	let pendingSkillMessage: PendingSkillMessage | undefined;
+	let runtimeModel: Model<any> | undefined;
 	let chainActive = false;
 	let loopState: LoopState | null = null;
 	let freshCollapse: FreshCollapse | null = null;
@@ -47,6 +65,10 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 	function sameModel(a: Model<any> | undefined, b: Model<any> | undefined): boolean {
 		if (!a || !b) return a === b;
 		return a.provider === b.provider && a.id === b.id;
+	}
+
+	function getCurrentModel(ctx: Pick<ExtensionContext, "model">): Model<any> | undefined {
+		return runtimeModel ?? ctx.model;
 	}
 
 	pi.registerMessageRenderer<SkillLoadedDetails>("skill-loaded", renderSkillLoaded);
@@ -76,6 +98,74 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		lastDiagnostics = fingerprint;
 	}
 
+	function consumePendingSkillMessage() {
+		if (!pendingSkillMessage) return undefined;
+		const message = pendingSkillMessage;
+		pendingSkillMessage = undefined;
+		return message;
+	}
+
+	function normalizeSkillName(skillName: string): string {
+		return skillName.startsWith("skill:") ? skillName.slice("skill:".length) : skillName;
+	}
+
+	function isPathResolvableSkillName(skillName: string): boolean {
+		if (skillName === "." || skillName === "..") return false;
+		if (skillName.includes("/")) return false;
+		if (skillName.includes("\\")) return false;
+		return true;
+	}
+
+	function resolveRegisteredSkillPath(skillName: string): string | undefined {
+		const normalizedSkillName = normalizeSkillName(skillName);
+		if (!normalizedSkillName) return undefined;
+		const candidates = new Set([normalizedSkillName, `skill:${normalizedSkillName}`]);
+
+		for (const command of pi.getCommands()) {
+			if (command.source !== "skill") continue;
+			if (!command.path) continue;
+			if (!candidates.has(command.name)) continue;
+			return command.path;
+		}
+
+		return undefined;
+	}
+
+	function resolveSkillMessage(skillName: string | undefined, cwd: string): SkillMessageResolution {
+		if (!skillName) {
+			return { kind: "none" };
+		}
+
+		const normalizedSkillName = normalizeSkillName(skillName);
+		if (!normalizedSkillName) {
+			return { kind: "error", error: `Skill "${skillName}" not found` };
+		}
+
+		const skillPath =
+			resolveRegisteredSkillPath(skillName) ?? (isPathResolvableSkillName(normalizedSkillName) ? resolveSkillPath(normalizedSkillName, cwd) : undefined);
+		if (!skillPath) {
+			return { kind: "error", error: `Skill "${skillName}" not found` };
+		}
+
+		try {
+			const skillContent = readSkillContent(skillPath);
+			return {
+				kind: "ready",
+				message: {
+					customType: "skill-loaded",
+					content: `<skill name="${normalizedSkillName}">\n${skillContent}\n</skill>`,
+					display: true,
+					details: { skillName: normalizedSkillName, skillContent, skillPath },
+				},
+			};
+		} catch (error) {
+			return {
+				kind: "error",
+				error: `Failed to read skill "${skillName}": ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+
 	async function waitForTurnStart(ctx: ExtensionContext) {
 		while (ctx.isIdle()) {
 			await new Promise((resolve) => setTimeout(resolve, 10));
@@ -90,25 +180,82 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		currentThinking?: ThinkingLevel,
 	) {
 		const restoredParts: string[] = [];
-		const shouldRestoreModel = originalModel !== undefined && !sameModel(originalModel, currentModel);
 		const shouldRestoreThinking =
 			originalThinking !== undefined && (currentThinking === undefined || currentThinking !== originalThinking);
 
-		if (shouldRestoreModel && originalModel) {
+		if (originalModel && !sameModel(originalModel, currentModel)) {
 			const restoredModel = await pi.setModel(originalModel);
 			if (restoredModel) {
+				runtimeModel = originalModel;
 				restoredParts.push(originalModel.id);
 			} else {
 				notify(ctx, `Failed to restore model ${originalModel.provider}/${originalModel.id}`, "error");
 			}
 		}
-		if (shouldRestoreThinking && originalThinking !== undefined) {
+		if (shouldRestoreThinking) {
 			restoredParts.push(`thinking:${originalThinking}`);
 			pi.setThinkingLevel(originalThinking);
 		}
 		if (restoredParts.length > 0) {
 			notify(ctx, `Restored to ${restoredParts.join(", ")}`, "info");
 		}
+	}
+
+	async function restoreAfterExecution(
+		ctx: ExtensionContext,
+		shouldRestore: boolean,
+		originalModel: Model<any> | undefined,
+		originalThinking: ThinkingLevel | undefined,
+		currentModel: Model<any> | undefined,
+		currentThinking: ThinkingLevel | undefined,
+		errorState: ExecutionErrorState,
+		phase: "loop" | "chain",
+	): Promise<ExecutionErrorState> {
+		if (!shouldRestore) return errorState;
+
+		try {
+			await restoreSessionState(ctx, originalModel, originalThinking, currentModel, currentThinking);
+		} catch (error) {
+			if (errorState.hasError) {
+				notify(
+					ctx,
+					`Failed to restore session state after ${phase} error: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+				return errorState;
+			}
+			return { hasError: true, error };
+		}
+
+		return errorState;
+	}
+
+	function notifyLoopCompletion(
+		ctx: ExtensionContext,
+		completedIterations: number,
+		totalIterations: number | null,
+		effectiveMax: number,
+		converged: boolean,
+		requireMultipleIterations: boolean,
+	) {
+		if (converged) {
+			const convergedLabel = totalIterations !== null ? `${completedIterations}/${totalIterations}` : `${completedIterations}`;
+			notify(ctx, `Loop converged at ${convergedLabel} (no changes)`, "info");
+			return;
+		}
+
+		if (completedIterations === 0) return;
+		if (requireMultipleIterations && effectiveMax <= 1) return;
+
+		if (totalIterations !== null) {
+			notify(ctx, `Loop finished: ${completedIterations}/${totalIterations} iterations`, "info");
+			return;
+		}
+		if (completedIterations === effectiveMax) {
+			notify(ctx, `Loop finished: ${completedIterations} iterations (cap reached)`, "info");
+			return;
+		}
+		notify(ctx, `Loop finished: ${completedIterations} iterations`, "info");
 	}
 
 	function updateLoopStatus(ctx: ExtensionContext) {
@@ -152,8 +299,10 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const savedModel = ctx.model;
+		const savedModel = getCurrentModel(ctx);
 		const savedThinking = pi.getThinkingLevel();
+		let currentModel = savedModel;
+		let currentThinking = savedThinking;
 		const shouldRestore = initialPrompt.restore;
 		const useFresh = freshFlag || initialPrompt.fresh === true;
 		const effectiveMax = totalIterations ?? UNLIMITED_LOOP_CAP;
@@ -166,6 +315,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		updateLoopStatus(ctx);
 		let completedIterations = 0;
 		let converged = false;
+		let loopErrorState: ExecutionErrorState = { hasError: false, error: undefined };
 
 		try {
 			for (let i = 0; i < effectiveMax; i++) {
@@ -181,7 +331,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 					break;
 				}
 
-				const prepared = await preparePromptExecution(prompt, parseCommandArgs(cleanedArgs), ctx.model, ctx.modelRegistry);
+				const prepared = await preparePromptExecution(prompt, parseCommandArgs(cleanedArgs), currentModel, ctx.modelRegistry);
 				if (!prepared) {
 					notify(ctx, `No available model from: ${prompt.models.join(", ")}`, "error");
 					break;
@@ -195,19 +345,29 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 					notify(ctx, prepared.warning, "warning");
 				}
 
+				const skillResolution = resolveSkillMessage(prompt.skill, ctx.cwd);
+				if (skillResolution.kind === "error") {
+					notify(ctx, skillResolution.error, "error");
+					break;
+				}
+
 				if (!prepared.selectedModel.alreadyActive) {
 					const switched = await pi.setModel(prepared.selectedModel.model);
 					if (!switched) {
 						notify(ctx, `Failed to switch to model ${prepared.selectedModel.model.provider}/${prepared.selectedModel.model.id}`, "error");
 						break;
 					}
+					runtimeModel = prepared.selectedModel.model;
 				}
+				currentModel = prepared.selectedModel.model;
+				currentThinking = pi.getThinkingLevel();
 
 				if (prompt.thinking) {
 					pi.setThinkingLevel(prompt.thinking);
+					currentThinking = pi.getThinkingLevel();
 				}
 
-				pendingSkill = prompt.skill ? { name: prompt.skill, cwd: ctx.cwd } : undefined;
+				pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
 				const iterationStartId = ctx.sessionManager.getLeafId();
 
 				pi.sendUserMessage(prepared.content);
@@ -230,29 +390,33 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 					}
 				}
 			}
+		} catch (error) {
+			loopErrorState = { hasError: true, error };
 		} finally {
+			loopErrorState = await restoreAfterExecution(
+				ctx,
+				shouldRestore,
+				savedModel,
+				savedThinking,
+				currentModel,
+				currentThinking,
+				loopErrorState,
+				"loop",
+			);
+
 			loopState = null;
-			pendingSkill = undefined;
+			pendingSkillMessage = undefined;
 			freshCollapse = null;
 			accumulatedSummaries = [];
 			updateLoopStatus(ctx);
 
-			if (converged) {
-				const convergedLabel = totalIterations !== null ? `${completedIterations}/${totalIterations}` : `${completedIterations}`;
-				notify(ctx, `Loop converged at ${convergedLabel} (no changes)`, "info");
-			} else if (completedIterations > 0) {
-				if (totalIterations !== null) {
-					notify(ctx, `Loop finished: ${completedIterations}/${totalIterations} iterations`, "info");
-				} else if (completedIterations === effectiveMax) {
-					notify(ctx, `Loop finished: ${completedIterations} iterations (cap reached)`, "info");
-				} else {
-					notify(ctx, `Loop finished: ${completedIterations} iterations`, "info");
-				}
+			if (!loopErrorState.hasError) {
+				notifyLoopCompletion(ctx, completedIterations, totalIterations, effectiveMax, converged, false);
 			}
+		}
 
-			if (shouldRestore) {
-				await restoreSessionState(ctx, savedModel, savedThinking, ctx.model, pi.getThinkingLevel());
-			}
+		if (loopErrorState.hasError) {
+			throw loopErrorState.error;
 		}
 	}
 
@@ -273,7 +437,9 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			}
 
 			for (const step of steps) {
-				if (prompts.get(step.name)?.chain) {
+				const stepPrompt = prompts.get(step.name);
+				if (!stepPrompt) continue;
+				if (stepPrompt.chain) {
 					notify(ctx, `Step "${step.name}" is a chain template. Chain nesting is not supported.`, "error");
 					return false;
 				}
@@ -284,12 +450,13 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 
 		if (!validateChainSteps()) return;
 
-		const originalModel = ctx.model;
+		const originalModel = getCurrentModel(ctx);
+		const chainInheritedModel = getCurrentModel(ctx);
 		const originalThinking = pi.getThinkingLevel();
 		let currentModel = originalModel;
 		let currentThinking = originalThinking;
 		chainActive = true;
-		pendingSkill = undefined;
+		pendingSkillMessage = undefined;
 		const effectiveMax = totalIterations ?? UNLIMITED_LOOP_CAP;
 		const isUnlimited = totalIterations === null;
 		const useConverge = isUnlimited ? true : converge;
@@ -298,6 +465,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		const chainStepNames = steps.map((step) => step.name).join(" -> ");
 		let completedIterations = 0;
 		let converged = false;
+		let chainErrorState: ExecutionErrorState = { hasError: false, error: undefined };
 		if (effectiveMax > 1) {
 			loopState = { currentIteration: 1, totalIterations };
 			accumulatedSummaries = [];
@@ -347,7 +515,9 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 							const iterSuffix = stepLoop > 1 ? ` (iter ${stepIteration + 1}/${stepLoop})` : "";
 							notify(ctx, `${loopPrefix}Step ${stepNumber}/${templates.length}: ${template.name}${iterSuffix} ${buildPromptCommandDescription(template)}`, "info");
 
-							const prepared = await preparePromptExecution(template, effectiveArgs, currentModel, ctx.modelRegistry);
+							const prepared = await preparePromptExecution(template, effectiveArgs, currentModel, ctx.modelRegistry, {
+								inheritedModel: chainInheritedModel,
+							});
 							if (!prepared) {
 								notify(
 									ctx,
@@ -367,6 +537,13 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 								notify(ctx, prepared.warning, "warning");
 							}
 
+							const skillResolution = resolveSkillMessage(template.skill, ctx.cwd);
+							if (skillResolution.kind === "error") {
+								notify(ctx, `Step ${stepNumber}/${templates.length} failed: ${skillResolution.error}`, "error");
+								aborted = true;
+								break;
+							}
+
 							if (!prepared.selectedModel.alreadyActive) {
 								const switched = await pi.setModel(prepared.selectedModel.model);
 								if (!switched) {
@@ -378,6 +555,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 									aborted = true;
 									break;
 								}
+								runtimeModel = prepared.selectedModel.model;
 							}
 
 							currentModel = prepared.selectedModel.model;
@@ -386,7 +564,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 								pi.setThinkingLevel(template.thinking);
 								currentThinking = pi.getThinkingLevel();
 							}
-							pendingSkill = template.skill ? { name: template.skill, cwd: ctx.cwd } : undefined;
+							pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
 
 							const stepIterationStartId = ctx.sessionManager.getLeafId();
 							pi.sendUserMessage(prepared.content);
@@ -426,29 +604,34 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			if (shouldRestore) {
-				await restoreSessionState(ctx, originalModel, originalThinking, currentModel, currentThinking);
-			}
+		} catch (error) {
+			chainErrorState = { hasError: true, error };
 		} finally {
-			pendingSkill = undefined;
+			chainErrorState = await restoreAfterExecution(
+				ctx,
+				shouldRestore,
+				originalModel,
+				originalThinking,
+				currentModel,
+				currentThinking,
+				chainErrorState,
+				"chain",
+			);
+
+			pendingSkillMessage = undefined;
 			chainActive = false;
 			loopState = null;
 			freshCollapse = null;
 			accumulatedSummaries = [];
 			updateLoopStatus(ctx);
 
-			if (converged) {
-				const convergedLabel = totalIterations !== null ? `${completedIterations}/${totalIterations}` : `${completedIterations}`;
-				notify(ctx, `Loop converged at ${convergedLabel} (no changes)`, "info");
-			} else if (effectiveMax > 1 && completedIterations > 0) {
-				if (totalIterations !== null) {
-					notify(ctx, `Loop finished: ${completedIterations}/${totalIterations} iterations`, "info");
-				} else if (completedIterations === effectiveMax) {
-					notify(ctx, `Loop finished: ${completedIterations} iterations (cap reached)`, "info");
-				} else {
-					notify(ctx, `Loop finished: ${completedIterations} iterations`, "info");
-				}
+			if (!chainErrorState.hasError) {
+				notifyLoopCompletion(ctx, completedIterations, totalIterations, effectiveMax, converged, true);
 			}
+		}
+
+		if (chainErrorState.hasError) {
+			throw chainErrorState.error;
 		}
 	}
 
@@ -514,7 +697,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const savedModel = ctx.model;
+		const savedModel = getCurrentModel(ctx);
 		const savedThinking = pi.getThinkingLevel();
 		const prepared = await preparePromptExecution(prompt, parseCommandArgs(args), savedModel, ctx.modelRegistry);
 		if (!prepared) {
@@ -530,12 +713,19 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			notify(ctx, prepared.warning, "warning");
 		}
 
+		const skillResolution = resolveSkillMessage(prompt.skill, ctx.cwd);
+		if (skillResolution.kind === "error") {
+			notify(ctx, skillResolution.error, "error");
+			return;
+		}
+
 		if (!prepared.selectedModel.alreadyActive) {
 			const switched = await pi.setModel(prepared.selectedModel.model);
 			if (!switched) {
 				notify(ctx, `Failed to switch to model ${prepared.selectedModel.model.provider}/${prepared.selectedModel.model.id}`, "error");
 				return;
 			}
+			runtimeModel = prepared.selectedModel.model;
 		}
 
 		if (prompt.restore && !prepared.selectedModel.alreadyActive) {
@@ -548,26 +738,36 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			}
 			pi.setThinkingLevel(prompt.thinking);
 		}
-		pendingSkill = prompt.skill ? { name: prompt.skill, cwd: ctx.cwd } : undefined;
+		pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
 
 		pi.sendUserMessage(prepared.content);
 		await waitForTurnStart(ctx);
 		await ctx.waitForIdle();
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	function resetSessionScopedState(ctx: ExtensionContext) {
 		storedCommandCtx = null;
+		pendingSkillMessage = undefined;
+		previousModel = undefined;
+		previousThinking = undefined;
+		runtimeModel = ctx.model;
 		toolManager.clearQueue();
 		refreshPrompts(ctx.cwd, ctx);
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		resetSessionScopedState(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
-		storedCommandCtx = null;
-		toolManager.clearQueue();
-		refreshPrompts(ctx.cwd, ctx);
+		resetSessionScopedState(ctx);
 	});
 
-	pi.on("before_agent_start", async (event, ctx) => {
+	pi.on("model_select", async (event) => {
+		runtimeModel = event.model;
+	});
+
+	pi.on("before_agent_start", async (event) => {
 		let systemPrompt = event.systemPrompt;
 
 		if (toolManager.isEnabled() && !loopState && !chainActive) {
@@ -586,37 +786,21 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 			systemPrompt += `\n\nYou are on ${iterText} of the same prompt. Previous iterations and their results are visible in the conversation above. Build on that work — focus on what remains to improve.`;
 		}
 
-		if (pendingSkill) {
-			const { name: skillName, cwd } = pendingSkill;
-			pendingSkill = undefined;
+		const skillMessage = consumePendingSkillMessage();
+		const hasSystemPromptOverride = systemPrompt !== event.systemPrompt;
+		if (!hasSystemPromptOverride && !skillMessage) return;
 
-			const skillPath = resolveSkillPath(skillName, cwd);
-			if (skillPath) {
-				try {
-					const skillContent = readSkillContent(skillPath);
-					pi.sendMessage<SkillLoadedDetails>({
-						customType: "skill-loaded",
-						content: `Loaded skill: ${skillName}`,
-						display: true,
-						details: { skillName, skillContent, skillPath },
-					});
-					systemPrompt += `\n\n<skill name="${skillName}">\n${skillContent}\n</skill>`;
-				} catch (error) {
-					notify(ctx, `Failed to read skill "${skillName}": ${error instanceof Error ? error.message : String(error)}`, "error");
-				}
-			} else {
-				notify(ctx, `Skill "${skillName}" not found`, "error");
-			}
-		}
-
-		if (systemPrompt !== event.systemPrompt) {
-			return { systemPrompt };
-		}
+		return {
+			...(hasSystemPromptOverride ? { systemPrompt } : {}),
+			...(skillMessage ? { message: skillMessage } : {}),
+		};
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (chainActive) return;
 		if (loopState) return;
+
+		runtimeModel = ctx.model;
 
 		const restoreModel = previousModel;
 		const restoreThinking = previousThinking;
@@ -625,7 +809,7 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 
 		const restoreFn = async () => {
 			if (restoreModel || restoreThinking !== undefined) {
-				await restoreSessionState(ctx, restoreModel, restoreThinking, ctx.model, pi.getThinkingLevel());
+				await restoreSessionState(ctx, restoreModel, restoreThinking, getCurrentModel(ctx), pi.getThinkingLevel());
 			}
 		};
 		const processed = await toolManager.processQueue(ctx, restoreFn);

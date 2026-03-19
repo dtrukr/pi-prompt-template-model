@@ -16,14 +16,40 @@ export interface EmptyPromptAbort {
 	warning?: string;
 }
 
+interface PromptExecutionOptions {
+	inheritedModel?: Model<any>;
+}
+
+function sameModel(a: Model<any> | undefined, b: Model<any> | undefined): boolean {
+	if (!a || !b) return a === b;
+	return a.provider === b.provider && a.id === b.id;
+}
+
 export async function preparePromptExecution(
 	prompt: Pick<PromptWithModel, "name" | "content" | "models">,
 	args: string[],
 	currentModel: Model<any> | undefined,
 	modelRegistry: Pick<ModelRegistry, "find" | "getAll" | "getAvailable" | "getApiKey" | "isUsingOAuth">,
+	options?: PromptExecutionOptions,
 ): Promise<PreparedPromptExecution | EmptyPromptAbort | undefined> {
-	const selectedModel = await selectModelCandidate(prompt.models, currentModel, modelRegistry);
+	const selectedModel =
+		prompt.models.length === 0
+			? (() => {
+				const hasInheritedModel = options !== undefined && Object.hasOwn(options, "inheritedModel");
+				const inheritedModel = hasInheritedModel ? options.inheritedModel : currentModel;
+				if (!inheritedModel) {
+					return {
+						message: `Prompt \`${prompt.name}\` has no \`model\` configured and there is no active session model to inherit.`,
+					};
+				}
+				return {
+					model: inheritedModel,
+					alreadyActive: sameModel(currentModel, inheritedModel),
+				};
+			})()
+			: await selectModelCandidate(prompt.models, currentModel, modelRegistry);
 	if (!selectedModel) return undefined;
+	if ("message" in selectedModel) return selectedModel;
 
 	const rendered = renderTemplateConditionals(prompt.content, getResolvedModelRef(selectedModel.model), prompt.name);
 	const content = substituteArgs(rendered.content, args);

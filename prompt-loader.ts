@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
 
@@ -436,8 +436,10 @@ function loadPromptsWithModelFromDir(
 				if (!frontmatter) continue;
 				const { body } = parsed;
 				const chain = normalizeChain(frontmatter.chain, fullPath, source, diagnostics);
-				const models = chain ? [] : normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
-				if (!chain && !models) continue;
+				const hasModelField = Object.hasOwn(frontmatter, "model");
+				const parsedModels = chain ? [] : normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
+				if (!chain && hasModelField && !parsedModels) continue;
+				const models = chain ? [] : (parsedModels ?? []);
 
 				const name = entry.name.slice(0, -3);
 				if (RESERVED_COMMAND_NAMES.has(name)) {
@@ -459,6 +461,17 @@ function loadPromptsWithModelFromDir(
 				const fresh = normalizeFresh(frontmatter.fresh, fullPath, source, diagnostics);
 				const loop = normalizeLoop(frontmatter.loop, fullPath, source, diagnostics);
 				const converge = normalizeConverge(frontmatter.converge, fullPath, source, diagnostics);
+				const hasModelConditionalDirectives = /<if-model(?:\s|>)|<else(?:\s|>)|<\/if-model\s*>|<\/else(?:\s|>)/.test(body);
+				const hasExtensionSpecificConfig =
+					skill !== undefined ||
+					thinking !== undefined ||
+					fresh === true ||
+					loop !== undefined ||
+					converge === false ||
+					hasModelConditionalDirectives;
+				if (!chain && !hasModelField && !hasExtensionSpecificConfig) {
+					continue;
+				}
 
 				prompts.push({
 					name,
@@ -550,7 +563,7 @@ export function buildPromptCommandDescription(prompt: PromptWithModel): string {
 		const details = `[chain: ${prompt.chain}] ${sourceLabel}`;
 		return prompt.description ? `${prompt.description} ${details}` : details;
 	}
-	const modelLabel = prompt.models.map((model) => model.split("/").pop() || model).join("|");
+	const modelLabel = prompt.models.length > 0 ? prompt.models.map((model) => model.split("/").pop() || model).join("|") : "current";
 	const skillLabel = prompt.skill ? ` +${prompt.skill}` : "";
 	const thinkingLabel = prompt.thinking ? ` ${prompt.thinking}` : "";
 	const loopLabel = prompt.loop ? ` loop:${prompt.loop}` : "";
@@ -558,14 +571,51 @@ export function buildPromptCommandDescription(prompt: PromptWithModel): string {
 	return prompt.description ? `${prompt.description} ${details}` : details;
 }
 
-export function resolveSkillPath(skillName: string, cwd: string): string | undefined {
-	const projectPath = resolve(cwd, ".pi", "skills", skillName, "SKILL.md");
-	if (existsSync(projectPath)) return projectPath;
+function getSkillCandidates(baseDir: string, skillName: string): string[] {
+	return [join(baseDir, skillName, "SKILL.md"), join(baseDir, `${skillName}.md`)];
+}
 
-	const userPath = join(homedir(), ".pi", "agent", "skills", skillName, "SKILL.md");
-	if (existsSync(userPath)) return userPath;
+function* walkAncestors(startDir: string, stopDir?: string): Generator<string> {
+	let current = startDir;
+	while (true) {
+		yield current;
+		if (stopDir && current === stopDir) return;
+		const parent = dirname(current);
+		if (parent === current) return;
+		current = parent;
+	}
+}
 
+function findRepoRoot(startDir: string): string | undefined {
+	for (const dir of walkAncestors(startDir)) {
+		if (existsSync(join(dir, ".git"))) return dir;
+	}
 	return undefined;
+}
+
+function findFirstExisting(paths: string[]): string | undefined {
+	for (const path of paths) {
+		if (existsSync(path)) return path;
+	}
+	return undefined;
+}
+
+export function resolveSkillPath(skillName: string, cwd: string): string | undefined {
+	const projectDir = resolve(cwd);
+
+	const projectPiSkill = findFirstExisting(getSkillCandidates(resolve(projectDir, ".pi", "skills"), skillName));
+	if (projectPiSkill) return projectPiSkill;
+
+	const repoRoot = findRepoRoot(projectDir);
+	for (const dir of walkAncestors(projectDir, repoRoot)) {
+		const projectAgentsSkill = findFirstExisting(getSkillCandidates(join(dir, ".agents", "skills"), skillName));
+		if (projectAgentsSkill) return projectAgentsSkill;
+	}
+
+	const globalPiSkill = findFirstExisting(getSkillCandidates(join(homedir(), ".pi", "agent", "skills"), skillName));
+	if (globalPiSkill) return globalPiSkill;
+
+	return findFirstExisting(getSkillCandidates(join(homedir(), ".agents", "skills"), skillName));
 }
 
 export function readSkillContent(skillPath: string): string {

@@ -114,3 +114,75 @@ test("preparePromptExecution renders conditionals against resolved fallback mode
 	assert.equal(prepared?.content, "not-haiku");
 	assert.equal(prepared?.selectedModel.model.id, "claude-sonnet-4-20250514");
 });
+
+test("preparePromptExecution inherits current model when prompt has no model frontmatter", async () => {
+	const prepared = await preparePromptExecution(
+		{
+			name: "demo",
+			models: [],
+			content: '<if-model is="anthropic/*">ok</if-model>',
+		},
+		[],
+		model as never,
+		registry as never,
+	);
+
+	assert.ok(prepared && !("message" in prepared));
+	assert.equal(prepared?.content, "ok");
+	assert.equal(prepared?.selectedModel.model.id, model.id);
+	assert.equal(prepared?.selectedModel.alreadyActive, true);
+});
+
+test("preparePromptExecution fails with clear error when prompt has no model and no current model", async () => {
+	const prepared = await preparePromptExecution(
+		{
+			name: "demo",
+			models: [],
+			content: "body",
+		},
+		[],
+		undefined,
+		registry as never,
+	);
+
+	assert.ok(prepared && "message" in prepared);
+	assert.match(prepared?.message ?? "", /has no `model` configured and there is no active session model/i);
+});
+
+test("preparePromptExecution can inherit a fixed model distinct from the current model", async () => {
+	const current = { provider: "anthropic", id: "claude-sonnet-4-20250514" };
+	const inherited = { provider: "anthropic", id: "claude-haiku-4-5" };
+	const prepared = await preparePromptExecution(
+		{
+			name: "demo",
+			models: [],
+			content: '<if-model is="claude-haiku-4-5">haiku<else>other</if-model>',
+		},
+		[],
+		current as never,
+		registry as never,
+		{ inheritedModel: inherited as never },
+	);
+
+	assert.ok(prepared && !("message" in prepared));
+	assert.equal(prepared?.content, "haiku");
+	assert.equal(prepared?.selectedModel.model.id, "claude-haiku-4-5");
+	assert.equal(prepared?.selectedModel.alreadyActive, false);
+});
+
+test("preparePromptExecution treats explicitly undefined inherited model as missing", async () => {
+	const prepared = await preparePromptExecution(
+		{
+			name: "demo",
+			models: [],
+			content: "body",
+		},
+		[],
+		model as never,
+		registry as never,
+		{ inheritedModel: undefined },
+	);
+
+	assert.ok(prepared && "message" in prepared);
+	assert.match(prepared?.message ?? "", /has no `model` configured and there is no active session model/i);
+});

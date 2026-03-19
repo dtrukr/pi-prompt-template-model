@@ -17,6 +17,7 @@ export function extractLoopCount(argsString: string): LoopExtraction | null {
 	let fresh = false;
 	let noConverge = false;
 	const tokensToRemove: Array<{ start: number; end: number }> = [];
+	const loopTokenRanges: Array<{ start: number; end: number }> = [];
 
 	let i = 0;
 	while (i < argsString.length) {
@@ -39,45 +40,46 @@ export function extractLoopCount(argsString: string): LoopExtraction | null {
 		while (i < argsString.length && !/\s/.test(argsString[i])) i++;
 		const token = argsString.slice(tokenStart, i);
 
-		if (!loopFound && (token === "--loop" || token.startsWith("--loop="))) {
-			if (token.startsWith("--loop=")) {
-				const value = token.slice("--loop=".length);
-				if (/^\d+$/.test(value)) {
-					const parsed = parseInt(value, 10);
-					if (parsed >= 1 && parsed <= 999) {
-						loopFound = true;
-						loopCount = parsed;
-						tokensToRemove.push({ start: tokenStart, end: i });
-					}
-				}
-			} else {
-				let lookahead = i;
-				while (lookahead < argsString.length && /\s/.test(argsString[lookahead])) lookahead++;
-
-				if (lookahead < argsString.length && argsString[lookahead] !== '"' && argsString[lookahead] !== "'") {
-					const nextTokenStart = lookahead;
-					while (lookahead < argsString.length && !/\s/.test(argsString[lookahead])) lookahead++;
-					const nextToken = argsString.slice(nextTokenStart, lookahead);
-
-					if (/^\d+$/.test(nextToken)) {
-						const parsed = parseInt(nextToken, 10);
-						if (parsed >= 1 && parsed <= 999) {
-							loopFound = true;
-							loopCount = parsed;
-							tokensToRemove.push({ start: tokenStart, end: i }, { start: nextTokenStart, end: lookahead });
-							i = lookahead;
-						}
-					} else {
-						loopFound = true;
-						loopCount = null;
-						tokensToRemove.push({ start: tokenStart, end: i });
-					}
-				} else {
+		if (token.startsWith("--loop=")) {
+			loopTokenRanges.push({ start: tokenStart, end: i });
+			const value = token.slice("--loop=".length);
+			if (/^\d+$/.test(value)) {
+				const parsed = parseInt(value, 10);
+				if (parsed >= 1 && parsed <= 999 && !loopFound) {
 					loopFound = true;
-					loopCount = null;
-					tokensToRemove.push({ start: tokenStart, end: i });
+					loopCount = parsed;
 				}
 			}
+			continue;
+		}
+
+		if (token === "--loop") {
+			let lookahead = i;
+			while (lookahead < argsString.length && /\s/.test(argsString[lookahead])) lookahead++;
+
+			if (lookahead < argsString.length && argsString[lookahead] !== '"' && argsString[lookahead] !== "'") {
+				const nextTokenStart = lookahead;
+				while (lookahead < argsString.length && !/\s/.test(argsString[lookahead])) lookahead++;
+				const nextToken = argsString.slice(nextTokenStart, lookahead);
+
+				if (/^\d+$/.test(nextToken)) {
+					loopTokenRanges.push({ start: tokenStart, end: i }, { start: nextTokenStart, end: lookahead });
+					const parsed = parseInt(nextToken, 10);
+					if (parsed >= 1 && parsed <= 999 && !loopFound) {
+						loopFound = true;
+						loopCount = parsed;
+					}
+					i = lookahead;
+					continue;
+				}
+			}
+
+			loopTokenRanges.push({ start: tokenStart, end: i });
+			if (!loopFound) {
+				loopFound = true;
+				loopCount = null;
+			}
+			continue;
 		}
 
 		if (token === "--fresh") {
@@ -91,15 +93,16 @@ export function extractLoopCount(argsString: string): LoopExtraction | null {
 		}
 	}
 
-	if (loopCount === null && !loopFound) return null;
+	if (!loopFound) return null;
 
-	tokensToRemove.sort((a, b) => b.start - a.start);
+	const allRanges = [...tokensToRemove, ...loopTokenRanges];
+	allRanges.sort((a, b) => b.start - a.start);
 	let cleaned = argsString;
-	for (const { start, end } of tokensToRemove) {
+	for (const { start, end } of allRanges) {
 		cleaned = cleaned.slice(0, start) + cleaned.slice(end);
 	}
 
-	const converge = loopFound && loopCount === null ? true : !noConverge;
+	const converge = loopCount === null ? true : !noConverge;
 	return { args: cleaned.trim(), loopCount, fresh, converge };
 }
 
@@ -227,6 +230,7 @@ export function substituteArgs(content: string, args: string[]): string {
 	const allArgs = args.join(" ");
 	result = result.replace(/\$ARGUMENTS/g, allArgs);
 	result = result.replace(/\$@/g, allArgs);
+	result = result.replace(/@\$/g, allArgs);
 
 	return result;
 }

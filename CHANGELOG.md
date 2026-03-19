@@ -2,9 +2,35 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-19
+
 ### Changed
 
 - Clarified the README chain examples so the optional ` -- ` shared-args separator is clearly distinct from loop flags like `--loop`, `--fresh`, and `--no-converge`.
+- Clarified in the README that chain frontmatter declarations support per-step `--loop N` inside the `chain:` value.
+- Argument substitution now accepts `@$` as an alias for `$@` for compatibility with commonly-typed placeholder variants.
+- Skill injection now uses a next-turn context message from `before_agent_start` instead of mutating the turn system prompt.
+- Non-chain templates can now omit `model` and inherit the current session model, so inline `<if-model ...>` rendering and skill injection still work without explicit model frontmatter.
+- Chain steps without `model` now inherit a fixed chain-start model snapshot, so model-less chain steps behave as if that model were declared in frontmatter while remaining deterministic across step switches.
+
+### Fixed
+
+- Chain step execution now avoids implicit previous-step model bleed for model-less templates by resolving them against the chain-start model snapshot instead of whichever model was active after the prior step.
+- Model-less prompt loading now skips plain templates that do not use extension features, preventing command collisions with other extension commands like `/review` and `/handover`.
+- Model-less prompt loading now also ignores no-op/invalid-only extension metadata (for example `restore`-only or invalid loop flags), so ineffective frontmatter does not unnecessarily claim command names.
+- Model-less prompt loading now recognizes invalid conditional closers like `</else>` as extension-relevant markup, so those templates stay in this extension path and surface proper conditional-parse warnings instead of silently bypassing extension handling.
+- Model-less prompt execution now tracks runtime model changes (`model_select` + internal switches/restores) and uses that tracked model instead of potentially stale command-context snapshots.
+- Prompt commands now fail fast when a configured `skill` file is missing or unreadable, instead of silently sending the prompt without skill context.
+- Skill resolution now returns a typed success/error outcome that callers handle explicitly, rather than emitting notifications from inside the resolver and returning sentinel `null` values.
+- Session start/switch now clear any queued skill context message so stale pending skill payloads cannot leak across session boundaries.
+- Session start/switch now also clear pending single-command restore state (`previousModel`/`previousThinking`) so restore writes cannot leak into a different session.
+- Skill frontmatter resolution now checks registered skill commands first (`pi.getCommands()` skill entries), accepts both `<name>` and `skill:<name>` values, searches additional standard pi skill locations (`.agents/skills` in project ancestors and `~/.agents/skills`), supports direct `<skill>.md` files alongside `SKILL.md` directories, and rejects traversal-like skill names for path fallback.
+- `extractLoopCount()` now strips repeated unquoted `--loop` tokens once looping is active, preventing stray loop flags from leaking into prompt arguments.
+- Chain frontmatter step parsing now strips repeated per-step `--loop` tokens once a valid per-step loop is resolved, and keeps the first valid value (including mixed invalid/valid numeric sequences like `--loop 1000 --loop 2`).
+- Loop-mode restore now tracks runtime model/thinking state per iteration instead of relying on command-context model snapshots, so model restoration remains correct even when command context values are stale.
+- Chain execution now restores model/thinking state in a `finally` path, so restore still runs after unexpected runtime errors during a chain step and chain cleanup state is still reset even when restore itself fails.
+- Loop and chain executions no longer report `Loop finished`/`Loop converged` when runtime errors abort execution mid-loop.
+- Loop and chain error propagation now preserves thrown falsy values (for example `throw 0`) instead of treating them as success, preventing swallowed errors and false completion notifications.
 
 ## [0.5.0] - 2026-03-17
 

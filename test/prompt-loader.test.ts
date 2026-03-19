@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPromptCommandDescription, loadPromptsWithModel, RESERVED_COMMAND_NAMES } from "../prompt-loader.js";
+import { buildPromptCommandDescription, loadPromptsWithModel, RESERVED_COMMAND_NAMES, resolveSkillPath } from "../prompt-loader.js";
 
 function withTempHome(run: (root: string) => void) {
 	const root = mkdtempSync(join(tmpdir(), "pi-prompt-template-model-"));
@@ -87,6 +87,88 @@ test("loadPromptsWithModel trims optional string frontmatter fields", () => {
 		assert.equal(result.prompts.get("trimmed")?.description, "Trim me");
 		assert.equal(result.prompts.get("trimmed")?.skill, "tmux");
 		assert.equal(result.prompts.get("trimmed")?.thinking, "high");
+	});
+});
+
+test("loadPromptsWithModel allows non-chain prompts without model and defaults description to current", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "inherit.md"), '---\ndescription: "inherit"\nskill: tmux\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		const prompt = result.prompts.get("inherit");
+		assert.ok(prompt);
+		assert.deepEqual(prompt.models, []);
+		assert.equal(buildPromptCommandDescription(prompt), "inherit [current +tmux] (project)");
+	});
+});
+
+test("loadPromptsWithModel ignores generic prompts without model or extension features", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "review.md"), '---\ndescription: "plain prompt"\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("review"), false);
+	});
+});
+
+test("loadPromptsWithModel keeps model-less prompts that use inline model conditionals", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "conditional.md"), '---\ndescription: "conditional"\n---\n<if-model is="anthropic/*">yes</if-model>');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("conditional"), true);
+	});
+});
+
+test("loadPromptsWithModel keeps model-less prompts containing invalid conditional closers", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "bad-conditional.md"), '---\ndescription: "bad conditional"\n---\n</else>');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("bad-conditional"), true);
+	});
+});
+
+test("loadPromptsWithModel ignores model-less prompts with restore-only config", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "restore-only.md"), '---\ndescription: "restore only"\nrestore: false\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("restore-only"), false);
+	});
+});
+
+test("loadPromptsWithModel ignores model-less prompts with only invalid extension flags", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "invalid-loop-only.md"), '---\ndescription: "invalid loop only"\nloop: 0\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("invalid-loop-only"), false);
+		assert.match(result.diagnostics.map((item) => item.message).join("\n"), /invalid loop value/i);
+	});
+});
+
+test("loadPromptsWithModel still rejects explicitly empty model declarations", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "bad-empty.md"), '---\nmodel: "   "\n---\nbody');
+
+		const result = loadPromptsWithModel(cwd);
+		assert.equal(result.prompts.has("bad-empty"), false);
+		assert.match(result.diagnostics.map((item) => item.message).join("\n"), /frontmatter field "model" is empty/i);
 	});
 });
 
@@ -289,6 +371,35 @@ test("buildPromptCommandDescription includes loop metadata", () => {
 		const prompt = result.prompts.get("deslop");
 		assert.ok(prompt);
 		assert.equal(buildPromptCommandDescription(prompt), "Deslop [claude-sonnet-4-20250514 +tmux loop:5] (project)");
+	});
+});
+
+test("resolveSkillPath searches project .pi, ancestor .agents, then global skills", () => {
+	withTempHome((root) => {
+		const repoRoot = join(root, "repo");
+		const cwd = join(repoRoot, "apps", "web");
+		mkdirSync(join(repoRoot, ".git"), { recursive: true });
+		mkdirSync(join(repoRoot, ".agents", "skills", "from-agents"), { recursive: true });
+		mkdirSync(join(cwd, ".pi", "skills"), { recursive: true });
+		mkdirSync(join(root, ".pi", "agent", "skills", "from-global"), { recursive: true });
+		writeFileSync(join(repoRoot, ".agents", "skills", "from-agents", "SKILL.md"), "agents skill");
+		writeFileSync(join(cwd, ".pi", "skills", "from-project.md"), "project skill");
+		writeFileSync(join(root, ".pi", "agent", "skills", "from-global", "SKILL.md"), "global skill");
+
+		assert.equal(resolveSkillPath("from-project", cwd), join(cwd, ".pi", "skills", "from-project.md"));
+		assert.equal(resolveSkillPath("from-agents", cwd), join(repoRoot, ".agents", "skills", "from-agents", "SKILL.md"));
+		assert.equal(resolveSkillPath("from-global", cwd), join(root, ".pi", "agent", "skills", "from-global", "SKILL.md"));
+	});
+});
+
+test("resolveSkillPath falls back to ~/.agents/skills", () => {
+	withTempHome((root) => {
+		const cwd = join(root, "project");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(join(root, ".agents", "skills"), { recursive: true });
+		writeFileSync(join(root, ".agents", "skills", "from-legacy.md"), "legacy skill");
+
+		assert.equal(resolveSkillPath("from-legacy", cwd), join(root, ".agents", "skills", "from-legacy.md"));
 	});
 });
 

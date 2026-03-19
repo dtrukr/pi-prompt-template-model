@@ -22,6 +22,7 @@ class FakePi {
 	commands = new Map<string, FakeCommand>();
 	tools = new Map<string, FakeTool>();
 	events = new Map<string, Array<(event: any, ctx: any) => Promise<any> | any>>();
+	skillCommands: Array<{ name: string; source: "skill"; path?: string }> = [];
 	userMessages: string[] = [];
 	setModelCalls: string[] = [];
 	currentModel = ACTIVE_MODEL;
@@ -37,6 +38,10 @@ class FakePi {
 		this.tools.set(tool.name, tool);
 	}
 
+	getCommands() {
+		return this.skillCommands;
+	}
+
 	on(event: string, handler: (event: any, ctx: any) => Promise<any> | any) {
 		const handlers = this.events.get(event) ?? [];
 		handlers.push(handler);
@@ -47,6 +52,16 @@ class FakePi {
 		for (const handler of this.events.get(event) ?? []) {
 			await handler(payload, ctx);
 		}
+	}
+
+	async emitWithResult(event: string, payload: any, ctx: any) {
+		let combined: Record<string, unknown> | undefined;
+		for (const handler of this.events.get(event) ?? []) {
+			const result = await handler(payload, ctx);
+			if (!result || typeof result !== "object") continue;
+			combined = { ...(combined ?? {}), ...(result as Record<string, unknown>) };
+		}
+		return combined;
 	}
 
 	async setModel(model: { provider: string; id: string }) {
@@ -86,7 +101,7 @@ function createContext(
 	cwd: string,
 	pi: FakePi,
 	models: Array<{ provider: string; id: string }> = [ACTIVE_MODEL],
-	options?: { branchEntries?: () => any[] },
+	options?: { branchEntries?: () => any[]; waitForIdle?: () => Promise<void> },
 ) {
 	let navigateCount = 0;
 	const notifications: string[] = [];
@@ -129,7 +144,11 @@ function createContext(
 		isIdle() {
 			return false;
 		},
-		async waitForIdle() {},
+		async waitForIdle() {
+			if (options?.waitForIdle) {
+				await options.waitForIdle();
+			}
+		},
 		sessionManager: {
 			getLeafId() {
 				return "root";
@@ -474,6 +493,35 @@ test("chain nesting is rejected when a step references a chain template", async 
 	});
 });
 
+test("chain steps without model inherit the chain-start model deterministically", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "first.md"), "---\nmodel: anthropic/target-model\n---\nFIRST");
+		writeFileSync(
+			join(cwd, ".pi", "prompts", "second.md"),
+			'---\ndescription: "inherits"\n---\nSECOND:<if-model is="anthropic/base-model">BASE<else>OTHER</if-model>',
+		);
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const chainPrompts = pi.commands.get("chain-prompts");
+		assert.ok(chainPrompts);
+		await chainPrompts.handler("first -> second", ctx);
+
+		assert.deepEqual(pi.userMessages, ["FIRST", "SECOND:BASE"]);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+	});
+});
+
 test("chain-prompts rejects empty step segments", async () => {
 	await withTempHome(async (root) => {
 		const cwd = join(root, "project");
@@ -602,5 +650,451 @@ test("queued run-prompt restores pending session state before executing queued c
 
 		await pi.emit("agent_end", {}, ctx);
 		assert.deepEqual(pi.setModelCalls, ["anthropic/loop-first", "anthropic/base-model", "anthropic/loop-second"]);
+	});
+});
+
+test("prompt loop does not report completion when execution throws mid-run", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nloop: 2\nconverge: false\n---\nTASK:$@`);
+
+		let idleCalls = 0;
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, [ACTIVE_MODEL], {
+			waitForIdle: async () => {
+				idleCalls++;
+				if (idleCalls === 2) throw new Error("mid-loop-crash");
+			},
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await assert.rejects(deslop.handler("", ctx), /mid-loop-crash/);
+		assert.doesNotMatch(getNotifications().join("\n"), /Loop finished|Loop converged/i);
+	});
+});
+
+test("prompt loop preserves falsy thrown errors and suppresses completion", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nloop: 2\nconverge: false\n---\nTASK:$@`);
+
+		let idleCalls = 0;
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, [ACTIVE_MODEL], {
+			waitForIdle: async () => {
+				idleCalls++;
+				if (idleCalls === 2) throw 0;
+			},
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await assert.rejects(deslop.handler("", ctx), (error) => error === 0);
+		assert.doesNotMatch(getNotifications().join("\n"), /Loop finished|Loop converged/i);
+	});
+});
+
+test("loop restore uses runtime model state even when command context model is stale", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), "---\nmodel: anthropic/target-model\n---\nARGS:$@");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const staleCtx = { ...ctx, model: baseModel };
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("task --loop 1", staleCtx);
+		assert.deepEqual(pi.currentModel, baseModel);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+	});
+});
+
+test("chain loop does not report completion when execution throws mid-run", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "pipeline.md"), "---\nchain: worker\nloop: 2\nconverge: false\n---\nignored");
+		writeFileSync(join(cwd, ".pi", "prompts", "worker.md"), `---\nmodel: ${MODEL_ID}\n---\nworker`);
+
+		let idleCalls = 0;
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, [ACTIVE_MODEL], {
+			waitForIdle: async () => {
+				idleCalls++;
+				if (idleCalls === 2) throw new Error("mid-loop-crash");
+			},
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		const pipeline = pi.commands.get("pipeline");
+		assert.ok(pipeline);
+		await assert.rejects(pipeline.handler("", ctx), /mid-loop-crash/);
+		assert.doesNotMatch(getNotifications().join("\n"), /Loop finished|Loop converged/i);
+	});
+});
+
+test("chain loop preserves falsy thrown errors and suppresses completion", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "pipeline.md"), "---\nchain: worker\nloop: 2\nconverge: false\n---\nignored");
+		writeFileSync(join(cwd, ".pi", "prompts", "worker.md"), `---\nmodel: ${MODEL_ID}\n---\nworker`);
+
+		let idleCalls = 0;
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, [ACTIVE_MODEL], {
+			waitForIdle: async () => {
+				idleCalls++;
+				if (idleCalls === 2) throw 0;
+			},
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		const pipeline = pi.commands.get("pipeline");
+		assert.ok(pipeline);
+		await assert.rejects(pipeline.handler("", ctx), (error) => error === 0);
+		assert.doesNotMatch(getNotifications().join("\n"), /Loop finished|Loop converged/i);
+	});
+});
+
+test("chain execution restores model after unexpected step failure", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "worker.md"), "---\nmodel: anthropic/target-model\n---\nworker");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models, {
+			waitForIdle: async () => {
+				throw new Error("step-failure");
+			},
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		const chainPrompts = pi.commands.get("chain-prompts");
+		assert.ok(chainPrompts);
+		await assert.rejects(chainPrompts.handler("worker", ctx), /step-failure/);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+		assert.deepEqual(pi.currentModel, baseModel);
+	});
+});
+
+test("chain cleanup runs even when restore throws", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(root, ".pi", "agent", "skills", "tmux"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "worker.md"), "---\nmodel: anthropic/target-model\nskill: tmux\n---\nworker");
+		writeFileSync(join(root, ".pi", "agent", "skills", "tmux", "SKILL.md"), "---\nname: tmux\ndescription: helper\n---\nUse tmux.");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		pi.setModel = async (model: { provider: string; id: string }) => {
+			pi.setModelCalls.push(`${model.provider}/${model.id}`);
+			if (model.id === "base-model") throw new Error("restore-crash");
+			pi.currentModel = model;
+			return true;
+		};
+
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const promptTool = pi.commands.get("prompt-tool");
+		assert.ok(promptTool);
+		await promptTool.handler("on", ctx);
+
+		const chainPrompts = pi.commands.get("chain-prompts");
+		assert.ok(chainPrompts);
+		await assert.rejects(chainPrompts.handler("worker", ctx), /restore-crash/);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model", "anthropic/base-model"]);
+
+		const beforeStart = await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx);
+		assert.ok(beforeStart);
+		assert.match(String(beforeStart.systemPrompt ?? ""), /run-prompt tool is available/i);
+		assert.equal("message" in beforeStart, false);
+	});
+});
+
+test("prompt without model inherits current model for conditionals and skill injection", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(root, ".pi", "agent", "skills", "tmux"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "double-check.md"), "---\nskill: tmux\n---\n<if-model is=\"anthropic/*\">KEEP<else>DROP</if-model>");
+		writeFileSync(join(root, ".pi", "agent", "skills", "tmux", "SKILL.md"), "---\nname: tmux\ndescription: tmux helper\n---\nAlways use tmux.");
+
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, [ACTIVE_MODEL]);
+		await pi.emit("session_start", {}, ctx);
+
+		const doubleCheck = pi.commands.get("double-check");
+		assert.ok(doubleCheck);
+		await doubleCheck.handler("", ctx);
+
+		assert.deepEqual(pi.userMessages, ["KEEP"]);
+		assert.deepEqual(pi.setModelCalls, []);
+
+		const beforeStart = await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx);
+		assert.ok(beforeStart);
+		const message = beforeStart.message as { customType?: string; content?: string } | undefined;
+		assert.equal(message?.customType, "skill-loaded");
+		assert.match(message?.content ?? "", /Always use tmux\./);
+	});
+});
+
+test("model-less prompt uses tracked runtime model even when command context model is stale", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "double-check.md"), '---\ndescription: "dc"\n---\n<if-model is="anthropic/target-model">TARGET<else>BASE</if-model>');
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		pi.currentModel = targetModel;
+		await pi.emit("model_select", { model: targetModel, previousModel: baseModel, source: "set" }, ctx);
+
+		const staleCtx = { ...ctx, model: baseModel };
+		const doubleCheck = pi.commands.get("double-check");
+		assert.ok(doubleCheck);
+		await doubleCheck.handler("", staleCtx);
+
+		assert.deepEqual(pi.userMessages, ["TARGET"]);
+		assert.deepEqual(pi.setModelCalls, []);
+	});
+});
+
+test("queued model-less prompt uses agent-end runtime model when stored command context is stale", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "double-check.md"), '---\ndescription: "dc"\n---\n<if-model is="anthropic/target-model">TARGET<else>BASE</if-model>');
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const staleCtx = { ...ctx, model: baseModel };
+		const promptTool = pi.commands.get("prompt-tool");
+		assert.ok(promptTool);
+		await promptTool.handler("on", staleCtx);
+
+		const runPromptTool = pi.tools.get("run-prompt");
+		assert.ok(runPromptTool);
+		await runPromptTool.execute("tool-call-model-less", { command: "double-check" });
+
+		pi.currentModel = targetModel;
+		await pi.emit("agent_end", {}, ctx);
+
+		assert.deepEqual(pi.userMessages, ["TARGET"]);
+		assert.deepEqual(pi.setModelCalls, []);
+	});
+});
+
+test("skill injects as before_agent_start message without mutating system prompt", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(root, ".pi", "agent", "skills", "tmux"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nskill: tmux\n---\nTASK:$@`);
+		writeFileSync(join(root, ".pi", "agent", "skills", "tmux", "SKILL.md"), "---\nname: tmux\ndescription: tmux helper\n---\nAlways use tmux.");
+
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		assert.deepEqual(pi.userMessages, ["TASK:demo"]);
+
+		const beforeStart = await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx);
+		assert.ok(beforeStart);
+		assert.equal("systemPrompt" in beforeStart, false);
+		const message = beforeStart.message as
+			| {
+					customType?: string;
+					content?: string;
+					display?: boolean;
+					details?: { skillName?: string; skillContent?: string; skillPath?: string };
+			  }
+			| undefined;
+		assert.ok(message);
+		assert.equal(message.customType, "skill-loaded");
+		assert.equal(message.display, true);
+		assert.match(message.content ?? "", /<skill name="tmux">/);
+		assert.match(message.content ?? "", /Always use tmux\./);
+		assert.equal(message.details?.skillName, "tmux");
+		assert.equal(await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx), undefined);
+	});
+});
+
+test("skill resolves from registered skill commands and supports skill: prefix", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		const skillPath = join(root, "custom-skills", "external-skill.md");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(root, "custom-skills"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nskill: skill:external-skill\n---\nTASK:$@`);
+		writeFileSync(skillPath, "---\nname: external-skill\ndescription: external\n---\nUse external skill.");
+
+		const pi = new FakePi();
+		pi.skillCommands = [{ name: "skill:external-skill", source: "skill", path: skillPath }];
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		assert.deepEqual(pi.userMessages, ["TASK:demo"]);
+
+		const beforeStart = await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx);
+		assert.ok(beforeStart);
+		const message = beforeStart.message as { content?: string; details?: { skillName?: string; skillPath?: string } } | undefined;
+		assert.ok(message);
+		assert.match(message.content ?? "", /Use external skill\./);
+		assert.equal(message.details?.skillName, "external-skill");
+		assert.equal(message.details?.skillPath, skillPath);
+	});
+});
+
+test("missing skill aborts before model switch and before_agent_start injection", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), "---\nmodel: anthropic/target-model\nskill: missing-skill\n---\nTASK:$@");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		assert.deepEqual(pi.setModelCalls, []);
+		assert.deepEqual(pi.currentModel, baseModel);
+		assert.deepEqual(pi.userMessages, []);
+		assert.equal(await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx), undefined);
+		assert.match(getNotifications().join("\n"), /Skill "missing-skill" not found/);
+	});
+});
+
+test("skill path traversal names are rejected", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nskill: ..\n---\nTASK:$@`);
+		writeFileSync(join(cwd, ".pi", "SKILL.md"), "Unexpected traversal target");
+
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx, getNotifications } = createContext(cwd, pi);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		assert.deepEqual(pi.userMessages, []);
+		assert.match(getNotifications().join("\n"), /Skill "\.\." not found/);
+	});
+});
+
+test("session switch clears queued skill message", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(root, ".pi", "agent", "skills", "tmux"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), `---\nmodel: ${MODEL_ID}\nskill: tmux\n---\nTASK:$@`);
+		writeFileSync(join(root, ".pi", "agent", "skills", "tmux", "SKILL.md"), "---\nname: tmux\ndescription: tmux helper\n---\nAlways use tmux.");
+
+		const pi = new FakePi();
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		await pi.emit("session_switch", {}, ctx);
+		assert.equal(await pi.emitWithResult("before_agent_start", { systemPrompt: "BASE" }, ctx), undefined);
+	});
+});
+
+test("session switch clears pending restore state", async () => {
+	await withTempHome(async (root) => {
+		const cwd = join(root, "project");
+		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "prompts", "deslop.md"), "---\nmodel: anthropic/target-model\nrestore: true\n---\nTASK:$@");
+
+		const baseModel = { provider: "anthropic", id: "base-model" };
+		const targetModel = { provider: "anthropic", id: "target-model" };
+		const models = [baseModel, targetModel];
+
+		const pi = new FakePi();
+		pi.currentModel = baseModel;
+		promptModelExtension(pi as never);
+		const { ctx } = createContext(cwd, pi, models);
+		await pi.emit("session_start", {}, ctx);
+
+		const deslop = pi.commands.get("deslop");
+		assert.ok(deslop);
+		await deslop.handler("demo", ctx);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model"]);
+		await pi.emit("session_switch", {}, ctx);
+		await pi.emit("agent_end", {}, ctx);
+		assert.deepEqual(pi.setModelCalls, ["anthropic/target-model"]);
 	});
 });
